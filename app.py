@@ -22,6 +22,7 @@ from models_tenant import (
 
 app = Flask(__name__)
 CORS(app)
+
 # ── Base de données ──────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
@@ -61,20 +62,14 @@ from models import (
 )
 db.init_app(app)
 
+# ── Modèles optionnels (chef de département) ─────────────────
+try:
+    from models import Evaluation, Prime, PosteOuvert, Candidat
+    CHEF_MODELS_AVAILABLE = True
+except ImportError:
+    CHEF_MODELS_AVAILABLE = False
+    print("⚠️  Modèles Evaluation/Prime/PosteOuvert/Candidat non disponibles")
 
-with app.app_context():
-    if not User.query.filter_by(email="admin@admin.com").first():
-        admin = User(
-            email="admin@admin.com",
-            password="admin123",
-            full_name="Admin",
-            role="admin"
-        )
-        db.session.add(admin)
-        db.session.commit()
-        print("✅ Admin créé")
-
-        
 # ── OTP storage (en mémoire, court-lived) ────────────────────
 verification_codes: dict = {}
 
@@ -182,6 +177,17 @@ try:
 except ImportError as e:
     ML_AVAILABLE = False
     print(f"⚠️  ML non disponible: {e}")
+
+# ============================================
+# MULTI-TENANT
+# ============================================
+
+try:
+    from tenant_routes import tenant_bp
+    app.register_blueprint(tenant_bp)
+    print("✅ Multi-tenant chargé")
+except ImportError as e:
+    print(f"⚠️  Multi-tenant non disponible: {e}")
 
 # ============================================
 # AUTHENTIFICATION
@@ -904,14 +910,9 @@ def get_users(user):
 
 # ── Export des données personnelles ─────────────────────────
 # IMPORTANT : cette route DOIT être déclarée AVANT /api/users/<int:user_id>
-# sinon Flask interpréterait "export-data" comme un entier et retournerait 404
 @app.route('/api/users/export-data', methods=['GET'])
 @require_auth
 def export_user_data(user):
-    """
-    Retourne un JSON complet de toutes les données
-    liées à l'utilisateur connecté (RGPD-friendly).
-    """
     tasks            = Task.query.filter_by(assigned_to_id=user.id).all()
     leaves           = Leave.query.filter_by(employee_id=user.id).all()
     messages         = Message.query.filter_by(sender_id=user.id).all()
@@ -953,7 +954,6 @@ def export_user_data(user):
 @app.route('/api/users/<int:user_id>', methods=['PUT'])
 @require_auth
 def update_user(user, user_id):
-    # Un employé ne peut modifier que son propre profil
     if user.role != 'admin' and user.id != user_id:
         return jsonify({'error': 'Accès refusé'}), 403
 
@@ -963,7 +963,6 @@ def update_user(user, user_id):
 
     data = request.json
 
-    # Champs modifiables par l'utilisateur lui-même
     if 'full_name' in data and data['full_name'].strip():
         target.full_name = data['full_name'].strip()
 
@@ -973,7 +972,6 @@ def update_user(user, user_id):
     if 'position' in data and data['position'].strip():
         target.position = data['position'].strip()
 
-    # Email et département : réservés à l'admin
     if user.role == 'admin':
         if 'department' in data and data['department'].strip():
             target.department = data['department'].strip()
@@ -982,7 +980,7 @@ def update_user(user, user_id):
             if existing and existing.id != user_id:
                 return jsonify({'error': 'Cet email est déjà utilisé'}), 400
             target.email = data['email'].strip()
-        if 'role' in data and data['role'] in ('admin', 'employee', 'chef_departement' ):
+        if 'role' in data and data['role'] in ('admin', 'employee', 'chef_departement'):
             target.role = data['role']
 
     db.session.commit()
@@ -1000,10 +998,9 @@ def set_chef(user, user_id):
         return jsonify({'error': 'Utilisateur non trouvé'}), 404
 
     data   = request.json
-    action = data.get('action')  # 'promote' ou 'revoke'
+    action = data.get('action')
 
     if action == 'promote':
-        # Révoquer l'ancien chef du même département si existant
         old_chef = User.query.filter_by(
             department=target.department,
             role='chef_departement'
@@ -1027,14 +1024,13 @@ def set_chef(user, user_id):
 
     db.session.commit()
     _refresh_ml_config()
-    return jsonify(target.to_dict())    
+    return jsonify(target.to_dict())
 
 
 # ── Suppression de compte ────────────────────────────────────
 @app.route('/api/users/<int:user_id>', methods=['DELETE'])
 @require_auth
 def delete_user(user, user_id):
-    # Un employé ne peut supprimer que son propre compte
     if user.role != 'admin' and user.id != user_id:
         return jsonify({'error': 'Accès refusé'}), 403
 
@@ -1042,13 +1038,11 @@ def delete_user(user, user_id):
     if not target:
         return jsonify({'error': 'Utilisateur non trouvé'}), 404
 
-    # Empêcher la suppression du dernier admin
     if target.role == 'admin':
         admin_count = User.query.filter_by(role='admin').count()
         if admin_count <= 1:
             return jsonify({'error': 'Impossible de supprimer le dernier administrateur'}), 400
 
-    # Invalider le token si l'utilisateur se supprime lui-même
     if user.id == user_id:
         token = request.headers.get('Authorization', '').replace('Bearer ', '')
         sessions.pop(token, None)
@@ -1057,12 +1051,10 @@ def delete_user(user, user_id):
 
     full_name = target.full_name
 
-    # Nettoyage avant suppression
     Notification.query.filter_by(user_id=user_id).delete()
     Activity.query.filter_by(user_id=user_id).delete()
     LoginHistory.query.filter_by(user_id=user_id).delete()
 
-    # Anonymiser feedbacks et réponses enquêtes
     Feedback.query.filter_by(author_id=user_id).update({'author_id': None})
     SurveyResponse.query.filter_by(user_id=user_id).update({'user_id': None})
 
@@ -1468,81 +1460,14 @@ def get_archives_stats(user):
     return jsonify(stats)
 
 # ============================================
-# ML — INITIALISATION
-# ============================================
-
-def init_ml_engine():
-    if not ML_AVAILABLE:
-        return
-    try:
-        _refresh_ml_config()
-        from ml_engine import orchestrator
-        result = orchestrator.initialize(
-            app.config['users'], app.config['tasks'], app.config['messages'],
-            app.config['leaves'], app.config['activities'], app.config['feedbacks'],
-            app.config['conversations']
-        )
-        print(f"🤖 ML initialisé: {result.get('n_employees', 0)} employés")
-    except Exception as e:
-        print(f"⚠️  ML partiel: {e}")
-
-
-
-    from tenant_routes import tenant_bp
-    app.register_blueprint(tenant_bp)
-    print("✅ Multi-tenant chargé")    
-
-
-
-
-
-
-
-# ============================================
-# CRÉATION DE LA DB + DONNÉES INITIALES
-# ============================================
-
-def seed_database():
-    """Insère les données de démarrage si la DB est vide."""
-    if User.query.count() > 0:
-        return
-
-    print("📦 Initialisation de la base de données...")
-
-    admin = User(
-        email          = 'admin@commsight.com',
-        password       = 'Admin@2025!',
-        full_name      = 'Administrateur Principal',
-        role           = 'admin',
-        department     = 'Direction',
-        position       = 'Directeur Général',
-        phone          = '+213 555 123 456',
-        email_verified = True,
-    )
-    db.session.add(admin)
-
-    folders = [
-        DocumentFolder(id=1, name='Documents RH',           parent_id=None, icon='users',       color='blue'),
-        DocumentFolder(id=2, name='Contrats',                parent_id=1,    icon='file-text',   color='green'),
-        DocumentFolder(id=3, name='Fiches de paie',          parent_id=1,    icon='credit-card', color='purple'),
-        DocumentFolder(id=4, name='Documents Administratifs',parent_id=None, icon='briefcase',   color='orange'),
-        DocumentFolder(id=5, name='Factures',                parent_id=4,    icon='file',        color='red'),
-        DocumentFolder(id=6, name='Rapports',                parent_id=None, icon='bar-chart',   color='cyan'),
-        DocumentFolder(id=7, name='Projets',                 parent_id=None, icon='folder',      color='indigo'),
-    ]
-    db.session.add_all(folders)
-    db.session.commit()
-    print("✅ Base de données initialisée")
-
-
-
-# ============================================
 # ÉVALUATIONS (Chef de département)
 # ============================================
 
 @app.route('/api/evaluations', methods=['GET'])
 @require_auth
 def get_evaluations(user):
+    if not CHEF_MODELS_AVAILABLE:
+        return jsonify([])
     if user.role == 'admin':
         evals = Evaluation.query.all()
     elif user.role == 'chef_departement':
@@ -1554,6 +1479,8 @@ def get_evaluations(user):
 @app.route('/api/evaluations', methods=['POST'])
 @require_auth
 def create_evaluation(user):
+    if not CHEF_MODELS_AVAILABLE:
+        return jsonify({'error': 'Fonctionnalité non disponible'}), 501
     if user.role not in ('admin', 'chef_departement'):
         return jsonify({'error': 'Accès refusé'}), 403
     data = request.json
@@ -1575,6 +1502,8 @@ def create_evaluation(user):
 @app.route('/api/evaluations/<int:eval_id>', methods=['PUT'])
 @require_auth
 def update_evaluation(user, eval_id):
+    if not CHEF_MODELS_AVAILABLE:
+        return jsonify({'error': 'Fonctionnalité non disponible'}), 501
     if user.role not in ('admin', 'chef_departement'):
         return jsonify({'error': 'Accès refusé'}), 403
     ev = db.session.get(Evaluation, eval_id)
@@ -1590,6 +1519,8 @@ def update_evaluation(user, eval_id):
 @app.route('/api/evaluations/<int:eval_id>', methods=['DELETE'])
 @require_auth
 def delete_evaluation(user, eval_id):
+    if not CHEF_MODELS_AVAILABLE:
+        return jsonify({'error': 'Fonctionnalité non disponible'}), 501
     if user.role not in ('admin', 'chef_departement'):
         return jsonify({'error': 'Accès refusé'}), 403
     ev = db.session.get(Evaluation, eval_id)
@@ -1606,6 +1537,8 @@ def delete_evaluation(user, eval_id):
 @app.route('/api/primes', methods=['GET'])
 @require_auth
 def get_primes(user):
+    if not CHEF_MODELS_AVAILABLE:
+        return jsonify([])
     if user.role == 'admin':
         primes = Prime.query.all()
     elif user.role == 'chef_departement':
@@ -1617,6 +1550,8 @@ def get_primes(user):
 @app.route('/api/primes', methods=['POST'])
 @require_auth
 def create_prime(user):
+    if not CHEF_MODELS_AVAILABLE:
+        return jsonify({'error': 'Fonctionnalité non disponible'}), 501
     if user.role not in ('admin', 'chef_departement'):
         return jsonify({'error': 'Accès refusé'}), 403
     data = request.json
@@ -1639,6 +1574,8 @@ def create_prime(user):
 @app.route('/api/primes/<int:prime_id>', methods=['PUT'])
 @require_auth
 def update_prime(user, prime_id):
+    if not CHEF_MODELS_AVAILABLE:
+        return jsonify({'error': 'Fonctionnalité non disponible'}), 501
     if user.role not in ('admin', 'chef_departement'):
         return jsonify({'error': 'Accès refusé'}), 403
     prime = db.session.get(Prime, prime_id)
@@ -1654,6 +1591,8 @@ def update_prime(user, prime_id):
 @app.route('/api/primes/<int:prime_id>', methods=['DELETE'])
 @require_auth
 def delete_prime(user, prime_id):
+    if not CHEF_MODELS_AVAILABLE:
+        return jsonify({'error': 'Fonctionnalité non disponible'}), 501
     if user.role not in ('admin', 'chef_departement'):
         return jsonify({'error': 'Accès refusé'}), 403
     prime = db.session.get(Prime, prime_id)
@@ -1670,6 +1609,8 @@ def delete_prime(user, prime_id):
 @app.route('/api/recrutement', methods=['GET'])
 @require_auth
 def get_recrutement(user):
+    if not CHEF_MODELS_AVAILABLE:
+        return jsonify([])
     if user.role == 'admin':
         postes = PosteOuvert.query.all()
     elif user.role == 'chef_departement':
@@ -1681,6 +1622,8 @@ def get_recrutement(user):
 @app.route('/api/recrutement', methods=['POST'])
 @require_auth
 def create_poste(user):
+    if not CHEF_MODELS_AVAILABLE:
+        return jsonify({'error': 'Fonctionnalité non disponible'}), 501
     if user.role not in ('admin', 'chef_departement'):
         return jsonify({'error': 'Accès refusé'}), 403
     data = request.json
@@ -1702,6 +1645,8 @@ def create_poste(user):
 @app.route('/api/recrutement/<int:poste_id>', methods=['PUT'])
 @require_auth
 def update_poste(user, poste_id):
+    if not CHEF_MODELS_AVAILABLE:
+        return jsonify({'error': 'Fonctionnalité non disponible'}), 501
     if user.role not in ('admin', 'chef_departement'):
         return jsonify({'error': 'Accès refusé'}), 403
     poste = db.session.get(PosteOuvert, poste_id)
@@ -1717,6 +1662,8 @@ def update_poste(user, poste_id):
 @app.route('/api/recrutement/<int:poste_id>', methods=['DELETE'])
 @require_auth
 def delete_poste(user, poste_id):
+    if not CHEF_MODELS_AVAILABLE:
+        return jsonify({'error': 'Fonctionnalité non disponible'}), 501
     if user.role not in ('admin', 'chef_departement'):
         return jsonify({'error': 'Accès refusé'}), 403
     poste = db.session.get(PosteOuvert, poste_id)
@@ -1729,6 +1676,8 @@ def delete_poste(user, poste_id):
 @app.route('/api/recrutement/<int:poste_id>/candidats', methods=['GET'])
 @require_auth
 def get_candidats(user, poste_id):
+    if not CHEF_MODELS_AVAILABLE:
+        return jsonify([])
     if user.role not in ('admin', 'chef_departement'):
         return jsonify({'error': 'Accès refusé'}), 403
     candidats = Candidat.query.filter_by(poste_id=poste_id).all()
@@ -1737,6 +1686,8 @@ def get_candidats(user, poste_id):
 @app.route('/api/recrutement/<int:poste_id>/candidats', methods=['POST'])
 @require_auth
 def add_candidat(user, poste_id):
+    if not CHEF_MODELS_AVAILABLE:
+        return jsonify({'error': 'Fonctionnalité non disponible'}), 501
     if user.role not in ('admin', 'chef_departement'):
         return jsonify({'error': 'Accès refusé'}), 403
     data = request.json
@@ -1757,6 +1708,8 @@ def add_candidat(user, poste_id):
 @app.route('/api/recrutement/candidats/<int:candidat_id>', methods=['PUT'])
 @require_auth
 def update_candidat(user, candidat_id):
+    if not CHEF_MODELS_AVAILABLE:
+        return jsonify({'error': 'Fonctionnalité non disponible'}), 501
     if user.role not in ('admin', 'chef_departement'):
         return jsonify({'error': 'Accès refusé'}), 403
     candidat = db.session.get(Candidat, candidat_id)
@@ -1772,6 +1725,8 @@ def update_candidat(user, candidat_id):
 @app.route('/api/recrutement/candidats/<int:candidat_id>', methods=['DELETE'])
 @require_auth
 def delete_candidat(user, candidat_id):
+    if not CHEF_MODELS_AVAILABLE:
+        return jsonify({'error': 'Fonctionnalité non disponible'}), 501
     if user.role not in ('admin', 'chef_departement'):
         return jsonify({'error': 'Accès refusé'}), 403
     candidat = db.session.get(Candidat, candidat_id)
@@ -1781,17 +1736,78 @@ def delete_candidat(user, candidat_id):
     db.session.commit()
     return jsonify({'message': 'Candidat supprimé'})
 
+# ============================================
+# ML — INITIALISATION
+# ============================================
+
+def init_ml_engine():
+    if not ML_AVAILABLE:
+        return
+    try:
+        _refresh_ml_config()
+        from ml_engine import orchestrator
+        result = orchestrator.initialize(
+            app.config['users'], app.config['tasks'], app.config['messages'],
+            app.config['leaves'], app.config['activities'], app.config['feedbacks'],
+            app.config['conversations']
+        )
+        print(f"🤖 ML initialisé: {result.get('n_employees', 0)} employés")
+    except Exception as e:
+        print(f"⚠️  ML partiel: {e}")
 
 # ============================================
-# DÉMARRAGE
+# SEED DATABASE
+# ============================================
+
+def seed_database():
+    """Insère les données de démarrage si la DB est vide."""
+    if User.query.count() > 0:
+        return
+
+    print("📦 Initialisation de la base de données...")
+
+    admin = User(
+        email          = 'admin@commsight.com',
+        password       = 'Admin@2025!',
+        full_name      = 'Administrateur Principal',
+        role           = 'admin',
+        department     = 'Direction',
+        position       = 'Directeur Général',
+        phone          = '+213 555 123 456',
+        email_verified = True,
+    )
+    db.session.add(admin)
+
+    folders = [
+        DocumentFolder(id=1, name='Documents RH',            parent_id=None, icon='users',       color='blue'),
+        DocumentFolder(id=2, name='Contrats',                 parent_id=1,    icon='file-text',   color='green'),
+        DocumentFolder(id=3, name='Fiches de paie',           parent_id=1,    icon='credit-card', color='purple'),
+        DocumentFolder(id=4, name='Documents Administratifs', parent_id=None, icon='briefcase',   color='orange'),
+        DocumentFolder(id=5, name='Factures',                 parent_id=4,    icon='file',        color='red'),
+        DocumentFolder(id=6, name='Rapports',                 parent_id=None, icon='bar-chart',   color='cyan'),
+        DocumentFolder(id=7, name='Projets',                  parent_id=None, icon='folder',      color='indigo'),
+    ]
+    db.session.add_all(folders)
+    db.session.commit()
+    print("✅ Base de données initialisée")
+
+# ============================================
+# INITIALISATION AU DÉMARRAGE DU MODULE
+# ── Ce bloc s'exécute quand gunicorn importe app.py
+# ── Il doit absolument tourner AVANT toute requête SQL
+# ============================================
+
+with app.app_context():
+    db.create_all()          # ← crée toutes les tables si elles n'existent pas
+    seed_database()          # ← insère admin + dossiers si DB vide
+    init_ml_engine()         # ← initialise le moteur ML (optionnel)
+    print("✅ Application initialisée")
+
+# ============================================
+# DÉMARRAGE (mode développement uniquement)
 # ============================================
 
 if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
-        seed_database()
-        init_ml_engine()
-
     print("\n" + "="*70)
     print(" COMMSIGHT — Backend + SQLAlchemy + Moteur ML")
     print("="*70)
