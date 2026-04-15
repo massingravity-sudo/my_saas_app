@@ -62,8 +62,7 @@ from models import (
 db.init_app(app)
 
 
-@app.before_first_request
-def create_admin():
+with app.app_context():
     if not User.query.filter_by(email="admin@admin.com").first():
         admin = User(
             email="admin@admin.com",
@@ -75,6 +74,7 @@ def create_admin():
         db.session.commit()
         print("✅ Admin créé")
 
+        
 # ── OTP storage (en mémoire, court-lived) ────────────────────
 verification_codes: dict = {}
 
