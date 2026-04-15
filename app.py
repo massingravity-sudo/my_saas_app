@@ -21,11 +21,13 @@ from models_tenant import (
 # ============================================
 
 app = Flask(__name__)
+
+# ── CORS ─────────────────────────────────────────────────────
 CORS(app, origins=[
-      
-    " my-front-app-rust.vercel.app", 
-    "http://localhost:5173"
-])
+    "https://my-front-app-rust.vercel.app",
+    "http://localhost:5173",
+    "http://localhost:3000",
+], supports_credentials=True)
 
 # ── Base de données ──────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -113,13 +115,32 @@ def send_email(to, subject, body):
         return False
 
 # ── Sessions (token → user_id) ───────────────────────────────
+# Token stable basé sur user_id + password hash
+# Survit aux redémarrages Railway — plus de déconnexions intempestives
 sessions: dict[str, int] = {}
 
+TOKEN_SECRET = os.environ.get('TOKEN_SECRET', 'commsight_secret_key_2025')
+
+def generate_stable_token(user_id: int, password: str) -> str:
+    """Génère un token déterministe qui survit aux redémarrages du serveur."""
+    raw = f"{user_id}:{password}:{TOKEN_SECRET}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
 def get_user_from_token(token: str):
+    # 1. Cherche en cache mémoire (rapide)
     uid = sessions.get(token)
-    if uid is None:
-        return None
-    return db.session.get(User, uid)
+    if uid:
+        return db.session.get(User, uid)
+
+    # 2. Après redémarrage : revalide le token contre la DB
+    try:
+        for user in User.query.all():
+            if generate_stable_token(user.id, user.password) == token:
+                sessions[token] = user.id  # remet en cache
+                return user
+    except Exception:
+        pass
+    return None
 
 def require_auth(f):
     def wrapper(*args, **kwargs):
@@ -159,16 +180,19 @@ def generate_task_code():
 
 def _refresh_ml_config():
     """Synchronise les données live pour le moteur ML."""
-    app.config['users']         = [u.to_dict(include_password=True) for u in User.query.all()]
-    app.config['tasks']         = [t.to_dict() for t in Task.query.all()]
-    app.config['messages']      = [m.to_dict() for m in Message.query.all()]
-    app.config['leaves']        = [l.to_dict() for l in Leave.query.all()]
-    app.config['activities']    = [a.to_dict() for a in Activity.query.order_by(Activity.timestamp.desc()).limit(500).all()]
-    app.config['feedbacks']     = [f.to_dict() for f in Feedback.query.all()]
-    app.config['conversations'] = [c.to_dict() for c in Conversation.query.all()]
+    try:
+        app.config['users']         = [u.to_dict(include_password=True) for u in User.query.all()]
+        app.config['tasks']         = [t.to_dict() for t in Task.query.all()]
+        app.config['messages']      = [m.to_dict() for m in Message.query.all()]
+        app.config['leaves']        = [l.to_dict() for l in Leave.query.all()]
+        app.config['activities']    = [a.to_dict() for a in Activity.query.order_by(Activity.timestamp.desc()).limit(500).all()]
+        app.config['feedbacks']     = [f.to_dict() for f in Feedback.query.all()]
+        app.config['conversations'] = [c.to_dict() for c in Conversation.query.all()]
+    except Exception as e:
+        print(f"⚠️  _refresh_ml_config erreur: {e}")
 
 # ============================================
-# MOTEUR ML
+# MOTEUR ML — attrape TOUS les types d'erreurs
 # ============================================
 
 try:
@@ -178,7 +202,7 @@ try:
     app.register_blueprint(mlops_bp)
     ML_AVAILABLE = True
     print("✅ Moteur ML chargé")
-except ImportError as e:
+except Exception as e:
     ML_AVAILABLE = False
     print(f"⚠️  ML non disponible: {e}")
 
@@ -190,7 +214,7 @@ try:
     from tenant_routes import tenant_bp
     app.register_blueprint(tenant_bp)
     print("✅ Multi-tenant chargé")
-except ImportError as e:
+except Exception as e:
     print(f"⚠️  Multi-tenant non disponible: {e}")
 
 # ============================================
@@ -217,7 +241,8 @@ def login():
     user.last_login     = datetime.utcnow()
     db.session.commit()
 
-    token = f"token_{user.id}_{datetime.utcnow().timestamp()}"
+    # Token stable — survit aux redémarrages
+    token = generate_stable_token(user.id, user.password)
     sessions[token] = user.id
     app.config.setdefault('sessions', {})
     app.config['sessions'][token] = user.id
@@ -693,7 +718,7 @@ def get_performance_analytics(user):
     depts = db.session.query(User.department).filter_by(role='employee').distinct().all()
     departments = []
     for (dept,) in depts:
-        all_t    = Task.query.filter_by(department=dept).all()
+        all_t     = Task.query.filter_by(department=dept).all()
         completed = sum(1 for t in all_t if t.status == 'done')
         total     = len(all_t)
         score     = round((completed / total * 100), 1) if total > 0 else 0
@@ -709,10 +734,10 @@ def get_performance_analytics(user):
 @require_admin
 def get_sentiment_analytics_legacy(user):
     all_fb = Feedback.query.all()
-    pos = sum(1 for f in all_fb if f.sentiment == 'positive')
-    neg = sum(1 for f in all_fb if f.sentiment == 'negative')
-    total = len(all_fb)
-    score = 50 + ((pos - neg) / total * 50) if total > 0 else 50
+    pos    = sum(1 for f in all_fb if f.sentiment == 'positive')
+    neg    = sum(1 for f in all_fb if f.sentiment == 'negative')
+    total  = len(all_fb)
+    score  = 50 + ((pos - neg) / total * 50) if total > 0 else 50
     return jsonify({
         'sentiment_score': round(score, 1),
         'positive_count':  pos,
@@ -734,15 +759,15 @@ def get_conversations(user):
     ).all()
     result = []
     for conv in convs:
-        msgs          = Message.query.filter_by(conversation_id=conv.id).order_by(Message.created_at.desc()).all()
-        last_msg      = msgs[0].to_dict() if msgs else None
-        unread        = sum(1 for m in msgs if m.sender_id != user.id and not m.read)
-        other         = next((p for p in conv.participants if p.id != user.id), None)
+        msgs     = Message.query.filter_by(conversation_id=conv.id).order_by(Message.created_at.desc()).all()
+        last_msg = msgs[0].to_dict() if msgs else None
+        unread   = sum(1 for m in msgs if m.sender_id != user.id and not m.read)
+        other    = next((p for p in conv.participants if p.id != user.id), None)
         result.append({
             **conv.to_dict(),
-            'name':        conv.name if conv.type == 'group' else (other.full_name if other else 'Inconnu'),
-            'avatar':      other.avatar if other and conv.type == 'private' else None,
-            'department':  other.department if other and conv.type == 'private' else conv.department,
+            'name':         conv.name if conv.type == 'group' else (other.full_name if other else 'Inconnu'),
+            'avatar':       other.avatar if other and conv.type == 'private' else None,
+            'department':   other.department if other and conv.type == 'private' else conv.department,
             'last_message': last_msg,
             'unread_count': unread,
         })
@@ -868,7 +893,6 @@ def search_users(user):
         'department': u.department, 'position': u.position, 'avatar': u.avatar
     } for u in base.all()])
 
-
 @app.route('/api/users/by-department', methods=['GET'])
 @require_admin
 def get_users_by_department(user):
@@ -911,9 +935,7 @@ def uploaded_file(filename):
 def get_users(user):
     return jsonify([u.to_dict() for u in User.query.filter_by(role='employee').all()])
 
-
 # ── Export des données personnelles ─────────────────────────
-# IMPORTANT : cette route DOIT être déclarée AVANT /api/users/<int:user_id>
 @app.route('/api/users/export-data', methods=['GET'])
 @require_auth
 def export_user_data(user):
@@ -930,17 +952,17 @@ def export_user_data(user):
                            .order_by(LoginHistory.timestamp.desc()).all()
 
     export = {
-        'export_date':       datetime.utcnow().isoformat(),
-        'user':              user.to_dict(),
-        'tasks':             [t.to_dict() for t in tasks],
-        'leaves':            [l.to_dict() for l in leaves],
-        'messages_sent':     [m.to_dict() for m in messages],
-        'notifications':     [n.to_dict() for n in notifs],
-        'activities':        [a.to_dict() for a in activities],
-        'feedbacks':         [f.to_dict() for f in feedbacks],
-        'survey_responses':  [r.to_dict() for r in survey_responses],
-        'documents_uploaded':[d.to_dict() for d in documents],
-        'login_history':     [h.to_dict() for h in login_history],
+        'export_date':        datetime.utcnow().isoformat(),
+        'user':               user.to_dict(),
+        'tasks':              [t.to_dict() for t in tasks],
+        'leaves':             [l.to_dict() for l in leaves],
+        'messages_sent':      [m.to_dict() for m in messages],
+        'notifications':      [n.to_dict() for n in notifs],
+        'activities':         [a.to_dict() for a in activities],
+        'feedbacks':          [f.to_dict() for f in feedbacks],
+        'survey_responses':   [r.to_dict() for r in survey_responses],
+        'documents_uploaded': [d.to_dict() for d in documents],
+        'login_history':      [h.to_dict() for h in login_history],
     }
 
     log_activity(user.id, 'export_data', 'Export des données personnelles')
@@ -948,11 +970,8 @@ def export_user_data(user):
     return Response(
         json.dumps(export, ensure_ascii=False, indent=2),
         mimetype='application/json',
-        headers={
-            'Content-Disposition': f'attachment; filename=mes-donnees-{user.id}.json'
-        }
+        headers={'Content-Disposition': f'attachment; filename=mes-donnees-{user.id}.json'}
     )
-
 
 # ── Mise à jour du profil ────────────────────────────────────
 @app.route('/api/users/<int:user_id>', methods=['PUT'])
@@ -969,10 +988,8 @@ def update_user(user, user_id):
 
     if 'full_name' in data and data['full_name'].strip():
         target.full_name = data['full_name'].strip()
-
     if 'phone' in data:
         target.phone = data['phone'].strip()
-
     if 'position' in data and data['position'].strip():
         target.position = data['position'].strip()
 
@@ -990,9 +1007,7 @@ def update_user(user, user_id):
     db.session.commit()
     log_activity(user.id, 'update_profile', f"Profil mis à jour: {target.full_name}")
     _refresh_ml_config()
-
     return jsonify(target.to_dict())
-
 
 @app.route('/api/users/<int:user_id>/set-chef', methods=['PUT'])
 @require_admin
@@ -1012,24 +1027,19 @@ def set_chef(user, user_id):
         if old_chef and old_chef.id != user_id:
             old_chef.role = 'employee'
             db.session.commit()
-
         target.role = 'chef_departement'
-        log_activity(user.id, 'promote_chef',
-                     f"{target.full_name} nommé chef de {target.department}")
-
+        log_activity(user.id, 'promote_chef', f"{target.full_name} nommé chef de {target.department}")
     elif action == 'revoke':
         if target.role != 'chef_departement':
             return jsonify({'error': "Cet utilisateur n'est pas chef de département"}), 400
         target.role = 'employee'
-        log_activity(user.id, 'revoke_chef',
-                     f"{target.full_name} révoqué de {target.department}")
+        log_activity(user.id, 'revoke_chef', f"{target.full_name} révoqué de {target.department}")
     else:
         return jsonify({'error': 'Action invalide. Utilisez promote ou revoke'}), 400
 
     db.session.commit()
     _refresh_ml_config()
     return jsonify(target.to_dict())
-
 
 # ── Suppression de compte ────────────────────────────────────
 @app.route('/api/users/<int:user_id>', methods=['DELETE'])
@@ -1058,7 +1068,6 @@ def delete_user(user, user_id):
     Notification.query.filter_by(user_id=user_id).delete()
     Activity.query.filter_by(user_id=user_id).delete()
     LoginHistory.query.filter_by(user_id=user_id).delete()
-
     Feedback.query.filter_by(author_id=user_id).update({'author_id': None})
     SurveyResponse.query.filter_by(user_id=user_id).update({'user_id': None})
 
@@ -1067,7 +1076,6 @@ def delete_user(user, user_id):
 
     _refresh_ml_config()
     print(f"🗑️  Compte supprimé: {full_name} (id={user_id})")
-
     return jsonify({'message': 'Compte supprimé avec succès'}), 200
 
 # ============================================
@@ -1075,7 +1083,7 @@ def delete_user(user, user_id):
 # ============================================
 
 def _analyze_sentiment_basic(text):
-    tl = text.lower()
+    tl  = text.lower()
     pos = sum(1 for w in ['bon','bien','excellent','super','génial','parfait','merci','content','satisfait','heureux'] if w in tl)
     neg = sum(1 for w in ['mauvais','mal','problème','jamais','rien','difficile','impossible','mécontent','insatisfait'] if w in tl)
     if pos > neg: return 'positive'
@@ -1100,7 +1108,7 @@ def get_surveys(user):
 @app.route('/api/surveys', methods=['POST'])
 @require_admin
 def create_survey(user):
-    data = request.json
+    data     = request.json
     deadline = None
     if data.get('deadline'):
         try:
@@ -1167,16 +1175,16 @@ def get_survey_results(user, survey_id):
     if not survey:
         return jsonify({'error': 'Enquête non trouvée'}), 404
 
-    responses     = SurveyResponse.query.filter_by(survey_id=survey_id).all()
-    total_emp_q   = User.query.filter_by(role='employee')
+    responses   = SurveyResponse.query.filter_by(survey_id=survey_id).all()
+    total_emp_q = User.query.filter_by(role='employee')
     if survey.target_department != 'all':
         total_emp_q = total_emp_q.filter_by(department=survey.target_department)
     total_emp = total_emp_q.count()
 
     results = {
-        'survey':           survey.to_dict(),
-        'total_responses':  len(responses),
-        'response_rate':    round(len(responses) / total_emp * 100, 1) if total_emp else 0,
+        'survey':             survey.to_dict(),
+        'total_responses':    len(responses),
+        'response_rate':      round(len(responses) / total_emp * 100, 1) if total_emp else 0,
         'questions_analysis': []
     }
     for i, question in enumerate(survey.questions or []):
@@ -1191,8 +1199,8 @@ def get_survey_results(user, survey_id):
             nums = [int(r) for r in qa['responses'] if r]
             if nums:
                 qa['average'] = round(sum(nums) / len(nums), 2)
-                qa['min'] = min(nums)
-                qa['max'] = max(nums)
+                qa['min']     = min(nums)
+                qa['max']     = max(nums)
         elif question['type'] == 'text':
             qa['text_responses'] = qa['responses']
         results['questions_analysis'].append(qa)
@@ -1233,7 +1241,7 @@ def create_feedback(user):
             pass
 
     fb = Feedback(
-        category  = data.get('category', 'suggestion'),
+        category  = category,
         title     = data.get('title'),
         content   = content,
         department= user.department,
@@ -1253,7 +1261,7 @@ def respond_to_feedback(user, feedback_id):
     fb = db.session.get(Feedback, feedback_id)
     if not fb:
         return jsonify({'error': 'Feedback non trouvé'}), 404
-    data = request.json
+    data      = request.json
     responses = fb.responses or []
     responses.append({'admin': user.full_name, 'message': data.get('message'), 'created_at': datetime.utcnow().isoformat()})
     fb.responses = responses
@@ -1267,7 +1275,7 @@ def respond_to_feedback(user, feedback_id):
 def get_feedback_stats(user):
     all_fb = Feedback.query.all()
     stats  = {
-        'total': len(all_fb),
+        'total':         len(all_fb),
         'by_category':   {c: sum(1 for f in all_fb if f.category == c) for c in ['suggestion','probleme','idee','autre']},
         'by_status':     {s: sum(1 for f in all_fb if f.status == s)   for s in ['new','in_progress','resolved','archived']},
         'by_sentiment':  {s: sum(1 for f in all_fb if f.sentiment == s) for s in ['positive','neutral','negative']},
@@ -1320,7 +1328,7 @@ def get_documents(user):
     if file_type:
         q = q.filter(Document.mime_type.like(f'{file_type}%'))
 
-    docs = q.order_by(Document.uploaded_at.desc()).all()
+    docs   = q.order_by(Document.uploaded_at.desc()).all()
     result = []
     for doc in docs:
         d = doc.to_dict()
@@ -1334,17 +1342,17 @@ def get_documents(user):
 def upload_document(user):
     if 'file' not in request.files:
         return jsonify({'error': 'Aucun fichier fourni'}), 400
-    file      = request.files['file']
-    folder_id = request.form.get('folder_id', type=int)
+    file        = request.files['file']
+    folder_id   = request.form.get('folder_id', type=int)
     description = request.form.get('description', '')
-    tags      = request.form.get('tags', '')
+    tags        = request.form.get('tags', '')
 
     if file.filename == '' or not allowed_file(file.filename):
         return jsonify({'error': 'Fichier invalide'}), 400
 
-    original  = secure_filename(file.filename)
-    unique    = f"{datetime.utcnow().timestamp()}_{original}"
-    filepath  = os.path.join(app.config['UPLOAD_FOLDER'], unique)
+    original = secure_filename(file.filename)
+    unique   = f"{datetime.utcnow().timestamp()}_{original}"
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique)
     file.save(filepath)
 
     doc = Document(
@@ -1422,7 +1430,7 @@ def share_document(user, doc_id):
     doc = db.session.get(Document, doc_id)
     if not doc:
         return jsonify({'error': 'Document non trouvé'}), 404
-    data = request.json
+    data   = request.json
     shared = doc.shared_with or []
     for uid in data.get('user_ids', []):
         if uid not in shared:
@@ -1438,7 +1446,7 @@ def share_document(user, doc_id):
 @app.route('/api/archives/stats', methods=['GET'])
 @require_auth
 def get_archives_stats(user):
-    docs = Document.query.all()
+    docs  = Document.query.all()
     stats = {
         'total_documents': len(docs),
         'total_size':      sum(d.size or 0 for d in docs),
@@ -1457,9 +1465,10 @@ def get_archives_stats(user):
     for doc in Document.query.order_by(Document.uploaded_at.desc()).limit(5).all():
         up = doc.uploader
         stats['recent_uploads'].append({
-            'id': doc.id, 'name': doc.name,
-            'uploaded_at': doc.uploaded_at.isoformat(),
-            'uploader': up.full_name if up else 'Inconnu',
+            'id':           doc.id,
+            'name':         doc.name,
+            'uploaded_at':  doc.uploaded_at.isoformat(),
+            'uploader':     up.full_name if up else 'Inconnu',
         })
     return jsonify(stats)
 
@@ -1558,16 +1567,16 @@ def create_prime(user):
         return jsonify({'error': 'Fonctionnalité non disponible'}), 501
     if user.role not in ('admin', 'chef_departement'):
         return jsonify({'error': 'Accès refusé'}), 403
-    data = request.json
+    data  = request.json
     prime = Prime(
-        employee_id  = data.get('employee_id'),
-        attributed_by= user.id,
-        department   = user.department,
-        type         = data.get('type', 'performance'),
-        amount       = data.get('amount', 0),
-        period       = data.get('period'),
-        reason       = data.get('reason', ''),
-        status       = 'pending',
+        employee_id   = data.get('employee_id'),
+        attributed_by = user.id,
+        department    = user.department,
+        type          = data.get('type', 'performance'),
+        amount        = data.get('amount', 0),
+        period        = data.get('period'),
+        reason        = data.get('reason', ''),
+        status        = 'pending',
     )
     db.session.add(prime)
     db.session.commit()
@@ -1630,7 +1639,7 @@ def create_poste(user):
         return jsonify({'error': 'Fonctionnalité non disponible'}), 501
     if user.role not in ('admin', 'chef_departement'):
         return jsonify({'error': 'Accès refusé'}), 403
-    data = request.json
+    data  = request.json
     poste = PosteOuvert(
         title        = data.get('title'),
         department   = user.department,
@@ -1694,16 +1703,16 @@ def add_candidat(user, poste_id):
         return jsonify({'error': 'Fonctionnalité non disponible'}), 501
     if user.role not in ('admin', 'chef_departement'):
         return jsonify({'error': 'Accès refusé'}), 403
-    data = request.json
+    data     = request.json
     candidat = Candidat(
-        poste_id   = poste_id,
-        full_name  = data.get('full_name'),
-        email      = data.get('email'),
-        phone      = data.get('phone', ''),
-        cv_url     = data.get('cv_url', ''),
-        note       = data.get('note', ''),
-        status     = 'nouveau',
-        added_by   = user.id,
+        poste_id  = poste_id,
+        full_name = data.get('full_name'),
+        email     = data.get('email'),
+        phone     = data.get('phone', ''),
+        cv_url    = data.get('cv_url', ''),
+        note      = data.get('note', ''),
+        status    = 'nouveau',
+        added_by  = user.id,
     )
     db.session.add(candidat)
     db.session.commit()
@@ -1764,7 +1773,6 @@ def init_ml_engine():
 # ============================================
 
 def seed_database():
-    """Insère les données de démarrage si la DB est vide."""
     if User.query.count() > 0:
         return
 
@@ -1796,30 +1804,23 @@ def seed_database():
     print("✅ Base de données initialisée")
 
 # ============================================
-# INITIALISATION AU DÉMARRAGE DU MODULE
-# ── Ce bloc s'exécute quand gunicorn importe app.py
-# ── Il doit absolument tourner AVANT toute requête SQL
+# DÉMARRAGE
 # ============================================
 
 with app.app_context():
-    db.create_all()          # ← crée toutes les tables si elles n'existent pas
-    seed_database()          # ← insère admin + dossiers si DB vide
-    init_ml_engine()         # ← initialise le moteur ML (optionnel)
+    db.create_all()
+    seed_database()
+    init_ml_engine()
     print("✅ Application initialisée")
 
-# ============================================
-# DÉMARRAGE (mode développement uniquement)
-# ============================================
-
 if __name__ == '__main__':
-    print("\n" + "="*70)
-    print(" COMMSIGHT — Backend + SQLAlchemy + Moteur ML")
-    print("="*70)
-    print(f"\n📍 Serveur:    http://localhost:5000")
-    print(f"💾 Base de données: {app.config['SQLALCHEMY_DATABASE_URI']}")
-    print(f"\n👤 Admin:      admin@commsight.com / Admin@2025!")
-    print(f"\n🤖 ML:         {'✅ disponible' if ML_AVAILABLE else '❌ pip install xgboost scikit-learn shap nltk prophet'}")
-    print("\n" + "="*70 + "\n")
-
     port = int(os.environ.get('PORT', 5000))
+    print(f"\n{'='*70}")
+    print(" COMMSIGHT — Backend + SQLAlchemy + Moteur ML")
+    print(f"{'='*70}")
+    print(f"\n📍 Serveur:    http://localhost:{port}")
+    print(f"💾 Base:       {app.config['SQLALCHEMY_DATABASE_URI']}")
+    print(f"\n👤 Admin:      admin@commsight.com / Admin@2025!")
+    print(f"🤖 ML:         {'✅ disponible' if ML_AVAILABLE else '❌ pip install scikit-learn xgboost shap nltk prophet pandas'}")
+    print(f"\n{'='*70}\n")
     app.run(debug=False, host='0.0.0.0', port=port)

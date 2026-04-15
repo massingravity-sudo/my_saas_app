@@ -5,4 +5,9 @@ flask-mail
 gunicorn
 Werkzeug
 numpy
+scikit-learn
+xgboost
+shap
+nltk
+prophet
 pandas

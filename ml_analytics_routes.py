@@ -6,7 +6,13 @@
 from flask import Blueprint, request, jsonify
 from datetime import datetime, timedelta
 from functools import wraps
-from ml_engine import orchestrator
+
+try:
+    from ml_engine import orchestrator
+    if orchestrator is None:
+        raise ImportError("orchestrator non initialisé")
+except Exception as e:
+    raise ImportError(f"ML engine indisponible: {e}")
 import logging
 
 logger = logging.getLogger(__name__)
