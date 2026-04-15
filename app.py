@@ -61,6 +61,20 @@ from models import (
 )
 db.init_app(app)
 
+
+@app.before_first_request
+def create_admin():
+    if not User.query.filter_by(email="admin@admin.com").first():
+        admin = User(
+            email="admin@admin.com",
+            password="admin123",
+            full_name="Admin",
+            role="admin"
+        )
+        db.session.add(admin)
+        db.session.commit()
+        print("✅ Admin créé")
+
 # ── OTP storage (en mémoire, court-lived) ────────────────────
 verification_codes: dict = {}
 
