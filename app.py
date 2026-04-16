@@ -7,9 +7,10 @@ import os
 import json
 import mimetypes
 import threading
-from flask_mail import Mail, Message as MailMessage
 import secrets
 import re
+import requests   # ← Resend via HTTP
+
 from models_tenant import (
     Tenant, TenantSubscription, TenantUser,
     SubscriptionPlan, TenantInvitation, TenantAuditLog
@@ -20,16 +21,16 @@ from models_tenant import (
 # ============================================
 
 app = Flask(__name__)
-CORS(app, origins=[
-    "http://localhost:5173",
-    "https://https://my-front-app-rust.vercel.app/"
-])
+CORS(app)
 
 # ── Base de données ──────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Railway injecte DATABASE_URL avec postgres:// — SQLAlchemy 2.x exige postgresql://
-_db_url = os.environ.get('DATABASE_URL', f"sqlite:///{os.path.join(BASE_DIR, 'commsight.db')}")
+_db_url = os.environ.get(
+    'DATABASE_URL',
+    f"sqlite:///{os.path.join(BASE_DIR, 'commsight.db')}"
+)
+# Railway injecte postgres:// — SQLAlchemy 2.x exige postgresql://
 if _db_url.startswith('postgres://'):
     _db_url = _db_url.replace('postgres://', 'postgresql://', 1)
 
@@ -37,27 +38,23 @@ app.config['SQLALCHEMY_DATABASE_URI'] = _db_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'pool_pre_ping': True,
-    'pool_recycle': 300,
+    'pool_recycle':  300,
 }
 
 # ── Upload ───────────────────────────────────────────────────
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'pdf', 'doc', 'docx', 'xls', 'xlsx'}
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+app.config['UPLOAD_FOLDER']        = UPLOAD_FOLDER
+app.config['MAX_CONTENT_LENGTH']   = 16 * 1024 * 1024
 
-# ── Email ────────────────────────────────────────────────────
-app.config['MAIL_SERVER']         = os.environ.get('MAIL_SERVER', 'smtp.gmail.com')
-app.config['MAIL_PORT']           = int(os.environ.get('MAIL_PORT', 587))
-app.config['MAIL_USE_TLS']        = True
-app.config['MAIL_USE_SSL']        = False
-app.config['MAIL_USERNAME']       = os.environ.get('MAIL_USERNAME', 'benslimanefaiz7@gmail.com')
-app.config['MAIL_PASSWORD']       = os.environ.get('MAIL_PASSWORD', 'yaeylorbnbjsztsj')
-app.config['MAIL_DEFAULT_SENDER'] = os.environ.get('MAIL_USERNAME', 'benslimanefaiz7@gmail.com')
-app.config['MAIL_TIMEOUT']        = 10   # ← timeout SMTP 10s max
-
-mail = Mail(app)
+# ── Resend (remplace Flask-Mail + SMTP) ─────────────────────
+# Met ta clé dans les variables d'env Railway : RESEND_API_KEY
+RESEND_API_KEY    = os.environ.get('RESEND_API_KEY', 're_g3MioSVJ_KFvC1E426PwQXFBWGMyUL8at')
+# L'expéditeur : si tu n'as pas encore de domaine vérifié sur Resend,
+# utilise "onboarding@resend.dev" pour les tests.
+# Dès que tu vérifies ton domaine, mets "CommSight <noreply@tondomaine.com>"
+RESEND_FROM      = os.environ.get('RESEND_FROM', 'noreply@commsight.com')
 
 # ── Initialisation DB ────────────────────────────────────────
 from models import (
@@ -69,11 +66,54 @@ from models import (
 )
 db.init_app(app)
 
-# ── OTP storage (en mémoire) ─────────────────────────────────
+# ── OTP storage ──────────────────────────────────────────────
 verification_codes: dict = {}
 
 # ── Sessions (token → user_id) ───────────────────────────────
 sessions: dict[str, int] = {}
+
+# ============================================
+# EMAIL  —  Resend API HTTP (jamais bloqué)
+# ============================================
+
+def send_email(to: str, subject: str, body: str) -> bool:
+    """
+    Envoie via l'API HTTP Resend dans un thread daemon.
+    - Jamais bloquant pour gunicorn
+    - Fonctionne sur Railway (pas de SMTP)
+    - Retourne True immédiatement
+    """
+    if not RESEND_API_KEY:
+        # Pas de clé configurée → log et continue (dev local)
+        print(f"⚠️  RESEND_API_KEY manquante — email non envoyé à {to}")
+        return False
+
+    def _send():
+        try:
+            resp = requests.post(
+                'https://api.resend.com/emails',
+                headers={
+                    'Authorization': f'Bearer {RESEND_API_KEY}',
+                    'Content-Type':  'application/json',
+                },
+                json={
+                    'from':    RESEND_FROM,
+                    'to':      [to],
+                    'subject': subject,
+                    'text':    body,
+                },
+                timeout=15,   # 15s max, ne bloque pas gunicorn (thread séparé)
+            )
+            if resp.status_code in (200, 201):
+                print(f"✅ Email envoyé → {to} [{subject}]")
+            else:
+                print(f"❌ Resend erreur {resp.status_code} → {resp.text}")
+        except Exception as e:
+            print(f"❌ send_email exception: {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
+    return True   # réponse immédiate au client
+
 
 # ============================================
 # UTILITAIRES
@@ -101,30 +141,6 @@ def generate_otp():
     return ''.join([str(secrets.randbelow(10)) for _ in range(6)])
 
 
-# ─────────────────────────────────────────────────────────────
-# send_email — NON BLOQUANT via thread
-# Le worker gunicorn ne sera JAMAIS bloqué par le SMTP
-# ─────────────────────────────────────────────────────────────
-def send_email(to: str, subject: str, body: str) -> bool:
-    """
-    Envoie l'email dans un thread séparé pour ne pas bloquer gunicorn.
-    Retourne True immédiatement ; l'envoi réel se fait en arrière-plan.
-    """
-    def _send():
-        try:
-            with app.app_context():
-                msg = MailMessage(subject, recipients=[to])
-                msg.body = body
-                mail.send(msg)
-                print(f"✅ Email envoyé → {to}")
-        except Exception as e:
-            print(f"❌ Email échoué → {to} : {e}")
-
-    t = threading.Thread(target=_send, daemon=True)
-    t.start()
-    return True   # on répond tout de suite au client
-
-
 def get_user_from_token(token: str):
     uid = sessions.get(token)
     if uid is None:
@@ -135,7 +151,7 @@ def get_user_from_token(token: str):
 def require_auth(f):
     def wrapper(*args, **kwargs):
         token = request.headers.get('Authorization', '').replace('Bearer ', '')
-        user = get_user_from_token(token)
+        user  = get_user_from_token(token)
         if not user:
             return jsonify({'error': 'Non authentifié'}), 401
         return f(user, *args, **kwargs)
@@ -146,7 +162,7 @@ def require_auth(f):
 def require_admin(f):
     def wrapper(*args, **kwargs):
         token = request.headers.get('Authorization', '').replace('Bearer ', '')
-        user = get_user_from_token(token)
+        user  = get_user_from_token(token)
         if not user or user.role != 'admin':
             return jsonify({'error': 'Accès refusé - Droits administrateur requis'}), 403
         return f(user, *args, **kwargs)
@@ -156,8 +172,7 @@ def require_admin(f):
 
 def log_activity(user_id: int, action: str, details: str):
     try:
-        act = Activity(user_id=user_id, action=action, details=details)
-        db.session.add(act)
+        db.session.add(Activity(user_id=user_id, action=action, details=details))
         db.session.commit()
     except Exception:
         db.session.rollback()
@@ -165,17 +180,17 @@ def log_activity(user_id: int, action: str, details: str):
 
 def create_notification(user_id: int, title: str, message: str, type: str = 'info'):
     try:
-        notif = Notification(user_id=user_id, title=title, message=message, type=type)
-        db.session.add(notif)
+        n = Notification(user_id=user_id, title=title, message=message, type=type)
+        db.session.add(n)
         db.session.commit()
-        return notif
+        return n
     except Exception:
         db.session.rollback()
         return None
 
 
 def generate_task_code():
-    year = datetime.now().year
+    year  = datetime.now().year
     count = Task.query.filter(Task.code.like(f'TSK-{year}-%')).count()
     return f'TSK-{year}-{str(count + 1).zfill(4)}'
 
@@ -186,7 +201,8 @@ def _refresh_ml_config():
         app.config['tasks']         = [t.to_dict() for t in Task.query.all()]
         app.config['messages']      = [m.to_dict() for m in Message.query.all()]
         app.config['leaves']        = [l.to_dict() for l in Leave.query.all()]
-        app.config['activities']    = [a.to_dict() for a in Activity.query.order_by(Activity.timestamp.desc()).limit(500).all()]
+        app.config['activities']    = [a.to_dict() for a in Activity.query.order_by(
+                                        Activity.timestamp.desc()).limit(500).all()]
         app.config['feedbacks']     = [f.to_dict() for f in Feedback.query.all()]
         app.config['conversations'] = [c.to_dict() for c in Conversation.query.all()]
     except Exception as e:
@@ -247,13 +263,12 @@ def login():
     app.config.setdefault('sessions', {})
     app.config['sessions'][token] = user.id
 
-    history = LoginHistory(
+    db.session.add(LoginHistory(
         user_id    = user.id,
         email      = email,
         ip_address = request.remote_addr,
-        user_agent = request.headers.get('User-Agent', 'Unknown')
-    )
-    db.session.add(history)
+        user_agent = request.headers.get('User-Agent', 'Unknown'),
+    ))
     db.session.commit()
 
     log_activity(user.id, 'login', f"Connexion de {user.full_name}")
@@ -267,10 +282,10 @@ def register_request():
     email     = data.get('email', '').strip()
     full_name = data.get('full_name', '')
 
-    if User.query.filter_by(email=email).first():
-        return jsonify({'error': 'Cet email est déjà utilisé'}), 400
     if not email or '@' not in email:
         return jsonify({'error': 'Email invalide'}), 400
+    if User.query.filter_by(email=email).first():
+        return jsonify({'error': 'Cet email est déjà utilisé'}), 400
 
     code = generate_otp()
     verification_codes[email] = {
@@ -279,13 +294,11 @@ def register_request():
         'type':    'registration',
         'data':    data,
     }
-    body = (
-        f"Bonjour {full_name},\n\n"
-        f"Votre code CommSight : {code}\n\n"
-        f"Expire dans 10 minutes.\n\nL'équipe CommSight"
+    send_email(
+        email,
+        'CommSight - Code de vérification',
+        f"Bonjour {full_name},\n\nVotre code CommSight : {code}\n\nExpire dans 10 minutes.\n\nL'équipe CommSight"
     )
-    send_email(email, 'CommSight - Code de vérification', body)
-    # ← on répond IMMÉDIATEMENT, l'email part en arrière-plan
     return jsonify({'message': 'Code envoyé', 'email': email}), 200
 
 
@@ -326,13 +339,11 @@ def verify_code():
 
     log_activity(user.id, 'account_created', f"Compte créé pour {user.full_name}")
     _refresh_ml_config()
-
-    body = (
-        f"Bonjour {user.full_name},\n\n"
-        f"Votre compte CommSight est créé !\n\n"
-        f"Email: {email}\nDépartement: {user.department}\n\nL'équipe CommSight"
+    send_email(
+        email,
+        'Bienvenue sur CommSight',
+        f"Bonjour {user.full_name},\n\nVotre compte est créé !\nEmail: {email}\nDépartement: {user.department}\n\nL'équipe CommSight"
     )
-    send_email(email, 'Bienvenue sur CommSight', body)
     return jsonify({'message': 'Compte créé', 'user': user.to_dict()}), 201
 
 
@@ -350,12 +361,11 @@ def forgot_password():
         'type':    'password_reset',
         'user_id': user.id,
     }
-    body = (
-        f"Bonjour {user.full_name},\n\n"
-        f"Code de réinitialisation : {code}\n\n"
-        f"Expire dans 15 minutes.\n\nL'équipe CommSight"
+    send_email(
+        email,
+        'CommSight - Réinitialisation mot de passe',
+        f"Bonjour {user.full_name},\n\nCode de réinitialisation : {code}\n\nExpire dans 15 minutes.\n\nL'équipe CommSight"
     )
-    send_email(email, 'CommSight - Réinitialisation mot de passe', body)
     return jsonify({'message': 'Si cet email existe, un code a été envoyé'}), 200
 
 
@@ -389,13 +399,11 @@ def reset_password():
     db.session.commit()
     del verification_codes[email]
     log_activity(user.id, 'password_reset', 'Mot de passe réinitialisé')
-
-    body = (
-        f"Bonjour {user.full_name},\n\n"
-        f"Votre mot de passe a été modifié.\n\n"
-        f"Si ce n'est pas vous, contactez l'admin immédiatement.\n\nL'équipe CommSight"
+    send_email(
+        email,
+        'CommSight - Mot de passe modifié',
+        f"Bonjour {user.full_name},\n\nVotre mot de passe a été modifié.\n\nSi ce n'est pas vous, contactez l'admin.\n\nL'équipe CommSight"
     )
-    send_email(email, 'CommSight - Mot de passe modifié', body)
     return jsonify({'message': 'Mot de passe réinitialisé'}), 200
 
 
@@ -405,23 +413,22 @@ def resend_code():
     if email not in verification_codes:
         return jsonify({'error': 'Aucune demande en cours'}), 400
 
-    stored = verification_codes[email]
-    code   = generate_otp()
+    stored            = verification_codes[email]
+    code              = generate_otp()
     stored['code']    = code
     stored['expires'] = datetime.utcnow() + timedelta(minutes=10)
 
     if stored['type'] == 'registration':
         full_name = stored['data'].get('full_name', 'Utilisateur')
     else:
-        u = db.session.get(User, stored.get('user_id'))
+        u         = db.session.get(User, stored.get('user_id'))
         full_name = u.full_name if u else 'Utilisateur'
 
-    body = (
-        f"Bonjour {full_name},\n\n"
-        f"Nouveau code CommSight : {code}\n\n"
-        f"Expire dans 10 minutes.\n\nL'équipe CommSight"
+    send_email(
+        email,
+        'CommSight - Nouveau code',
+        f"Bonjour {full_name},\n\nNouveau code CommSight : {code}\n\nExpire dans 10 minutes.\n\nL'équipe CommSight"
     )
-    send_email(email, 'CommSight - Nouveau code', body)
     return jsonify({'message': 'Nouveau code envoyé'}), 200
 
 
@@ -451,8 +458,11 @@ def change_password(user):
     user.password = new_password
     db.session.commit()
     log_activity(user.id, 'password_changed', 'Mot de passe modifié')
-    send_email(user.email, 'CommSight - Mot de passe modifié',
-               f"Bonjour {user.full_name},\n\nVotre mot de passe a été modifié.\n\nL'équipe CommSight")
+    send_email(
+        user.email,
+        'CommSight - Mot de passe modifié',
+        f"Bonjour {user.full_name},\n\nVotre mot de passe a été modifié.\n\nL'équipe CommSight"
+    )
     return jsonify({'message': 'Mot de passe modifié'}), 200
 
 # ============================================
@@ -463,12 +473,12 @@ def change_password(user):
 @require_auth
 def get_posts(user):
     if user.role == 'admin':
-        all_posts = Post.query.order_by(Post.created_at.desc()).all()
+        posts = Post.query.order_by(Post.created_at.desc()).all()
     else:
-        all_posts = Post.query.filter(
+        posts = Post.query.filter(
             (Post.department == 'all') | (Post.department == user.department)
         ).order_by(Post.created_at.desc()).all()
-    return jsonify([p.to_dict() for p in all_posts])
+    return jsonify([p.to_dict() for p in posts])
 
 
 @app.route('/api/posts', methods=['POST'])
@@ -515,12 +525,12 @@ def like_post(user, post_id):
 @require_auth
 def get_tasks(user):
     if user.role == 'admin':
-        all_tasks = Task.query.all()
+        tasks = Task.query.all()
     else:
-        all_tasks = Task.query.filter(
+        tasks = Task.query.filter(
             (Task.department == user.department) | (Task.assigned_to_id == user.id)
         ).all()
-    return jsonify([t.to_dict() for t in all_tasks])
+    return jsonify([t.to_dict() for t in tasks])
 
 
 @app.route('/api/tasks', methods=['POST'])
@@ -616,10 +626,10 @@ def delete_task(user, task_id):
 @require_auth
 def get_leaves(user):
     if user.role == 'admin':
-        all_leaves = Leave.query.all()
+        leaves = Leave.query.all()
     else:
-        all_leaves = Leave.query.filter_by(employee_id=user.id).all()
-    return jsonify([l.to_dict() for l in all_leaves])
+        leaves = Leave.query.filter_by(employee_id=user.id).all()
+    return jsonify([l.to_dict() for l in leaves])
 
 
 @app.route('/api/leaves', methods=['POST'])
@@ -658,7 +668,7 @@ def review_leave(user, leave_id):
         leave.employee_id,
         f"Congé {leave.status}",
         f"Votre demande de congé a été {leave.status}",
-        'success' if leave.status == 'approved' else 'error'
+        'success' if leave.status == 'approved' else 'error',
     )
     log_activity(user.id, 'review_leave',
                  f"Congé {leave.status}: {leave.employee.full_name}")
@@ -732,7 +742,7 @@ def get_dashboard_stats(user):
     return jsonify(stats)
 
 # ============================================
-# ANALYTICS CLASSIQUES
+# ANALYTICS
 # ============================================
 
 @app.route('/api/analytics/communication', methods=['GET'])
@@ -744,8 +754,7 @@ def get_communication_analytics(user):
         if count < 2:
             isolated.append({'id': emp.id, 'name': emp.full_name,
                              'department': emp.department, 'task_count': count})
-    return jsonify({'isolated_employees': isolated, 'communication_score': 75,
-                    'note': 'ML avancé: GET /api/ml/collaboration/network'})
+    return jsonify({'isolated_employees': isolated, 'communication_score': 75})
 
 
 @app.route('/api/analytics/performance', methods=['GET'])
@@ -757,13 +766,13 @@ def get_performance_analytics(user):
         completed = sum(1 for t in all_t if t.status == 'done')
         total     = len(all_t)
         departments.append({
-            'name': dept,
-            'score': round((completed / total * 100), 1) if total > 0 else 0,
-            'tasks_completed': completed, 'tasks_total': total,
-            'employees_count': User.query.filter_by(department=dept).count(),
+            'name':             dept,
+            'score':            round((completed / total * 100), 1) if total > 0 else 0,
+            'tasks_completed':  completed,
+            'tasks_total':      total,
+            'employees_count':  User.query.filter_by(department=dept).count(),
         })
-    return jsonify({'departments': departments, 'overall_score': 80,
-                    'note': 'ML avancé: GET /api/ml/full-analysis'})
+    return jsonify({'departments': departments, 'overall_score': 80})
 
 
 @app.route('/api/analytics/sentiment', methods=['GET'])
@@ -780,7 +789,6 @@ def get_sentiment_analytics_legacy(user):
         'negative_count':  neg,
         'neutral_count':   sum(1 for f in all_fb if f.sentiment == 'neutral'),
         'total_feedbacks': total,
-        'ml_endpoint':     '/api/ml/sentiment/batch-analysis',
     })
 
 # ============================================
@@ -808,7 +816,7 @@ def get_conversations(user):
         })
     result.sort(
         key=lambda x: x['last_message']['created_at'] if x['last_message'] else x['created_at'],
-        reverse=True
+        reverse=True,
     )
     return jsonify(result)
 
@@ -825,7 +833,6 @@ def get_or_create_conversation(user, user_id):
     ).filter(
         Conversation.participants.any(id=user_id)
     ).first()
-
     if existing:
         return jsonify(existing.to_dict())
 
@@ -938,7 +945,7 @@ def search_users(user):
         ))
     return jsonify([{
         'id': u.id, 'full_name': u.full_name, 'email': u.email,
-        'department': u.department, 'position': u.position, 'avatar': u.avatar
+        'department': u.department, 'position': u.position, 'avatar': u.avatar,
     } for u in base.all()])
 
 
@@ -949,10 +956,10 @@ def get_users_by_department(user):
         'Informatique', 'Ressources Humaines', 'Finance',
         'Marketing', 'Commercial', 'Production', 'Logistique',
     ]
-    result = {}
-    for dept in departments:
-        result[dept] = [u.to_dict() for u in User.query.filter_by(department=dept).all()]
-    return jsonify(result)
+    return jsonify({
+        dept: [u.to_dict() for u in User.query.filter_by(department=dept).all()]
+        for dept in departments
+    })
 
 
 @app.route('/api/users', methods=['GET'])
@@ -961,7 +968,7 @@ def get_users(user):
     return jsonify([u.to_dict() for u in User.query.filter_by(role='employee').all()])
 
 
-# ── Export RGPD ── DOIT être avant /api/users/<int:user_id>
+# ── DOIT être AVANT /api/users/<int:user_id> ────────────────
 @app.route('/api/users/export-data', methods=['GET'])
 @require_auth
 def export_user_data(user):
@@ -980,11 +987,11 @@ def export_user_data(user):
         'login_history':      [h.to_dict() for h in LoginHistory.query.filter_by(user_id=user.id)
                                 .order_by(LoginHistory.timestamp.desc()).all()],
     }
-    log_activity(user.id, 'export_data', 'Export des données personnelles')
+    log_activity(user.id, 'export_data', 'Export RGPD')
     return Response(
         json.dumps(export, ensure_ascii=False, indent=2),
         mimetype='application/json',
-        headers={'Content-Disposition': f'attachment; filename=mes-donnees-{user.id}.json'}
+        headers={'Content-Disposition': f'attachment; filename=mes-donnees-{user.id}.json'},
     )
 
 
@@ -1104,8 +1111,8 @@ def uploaded_file(filename):
 
 def _analyze_sentiment_basic(text):
     tl  = text.lower()
-    pos = sum(1 for w in ['bon','bien','excellent','super','génial','parfait','merci',
-                           'content','satisfait','heureux'] if w in tl)
+    pos = sum(1 for w in ['bon','bien','excellent','super','génial','parfait',
+                           'merci','content','satisfait','heureux'] if w in tl)
     neg = sum(1 for w in ['mauvais','mal','problème','jamais','rien','difficile',
                            'impossible','mécontent','insatisfait'] if w in tl)
     if pos > neg: return 'positive'
@@ -1121,7 +1128,8 @@ def get_surveys(user):
         if s.target_department not in ('all', user.department) and user.role != 'admin':
             continue
         d = s.to_dict()
-        d['has_responded']  = SurveyResponse.query.filter_by(survey_id=s.id, user_id=user.id).count() > 0
+        d['has_responded']  = SurveyResponse.query.filter_by(
+            survey_id=s.id, user_id=user.id).count() > 0
         d['response_count'] = SurveyResponse.query.filter_by(survey_id=s.id).count()
         result.append(d)
     result.sort(key=lambda x: x['created_at'], reverse=True)
@@ -1180,18 +1188,17 @@ def respond_to_survey(user, survey_id):
         return jsonify({'error': 'Enquête non trouvée'}), 404
     if SurveyResponse.query.filter_by(survey_id=survey_id, user_id=user.id).count():
         return jsonify({'error': 'Vous avez déjà répondu'}), 400
-
-    data     = request.json or {}
-    response = SurveyResponse(
+    data = request.json or {}
+    r    = SurveyResponse(
         survey_id  = survey_id,
         user_id    = user.id if not survey.anonymous else None,
         department = user.department,
         answers    = data.get('answers', []),
     )
-    db.session.add(response)
+    db.session.add(r)
     db.session.commit()
     log_activity(user.id, 'respond_survey', f"Réponse enquête: {survey.title}")
-    return jsonify({'message': 'Réponse enregistrée', 'response': response.to_dict()}), 201
+    return jsonify({'message': 'Réponse enregistrée', 'response': r.to_dict()}), 201
 
 
 @app.route('/api/surveys/<int:survey_id>/results', methods=['GET'])
@@ -1200,24 +1207,20 @@ def get_survey_results(user, survey_id):
     survey = db.session.get(Survey, survey_id)
     if not survey:
         return jsonify({'error': 'Enquête non trouvée'}), 404
-
     responses   = SurveyResponse.query.filter_by(survey_id=survey_id).all()
     total_emp_q = User.query.filter_by(role='employee')
     if survey.target_department != 'all':
         total_emp_q = total_emp_q.filter_by(department=survey.target_department)
     total_emp = total_emp_q.count()
-
     results = {
-        'survey':              survey.to_dict(),
-        'total_responses':     len(responses),
-        'response_rate':       round(len(responses) / total_emp * 100, 1) if total_emp else 0,
-        'questions_analysis':  [],
+        'survey':             survey.to_dict(),
+        'total_responses':    len(responses),
+        'response_rate':      round(len(responses) / total_emp * 100, 1) if total_emp else 0,
+        'questions_analysis': [],
     }
     for i, question in enumerate(survey.questions or []):
-        qa = {
-            'question':  question,
-            'responses': [r.answers[i] for r in responses if i < len(r.answers or [])],
-        }
+        qa = {'question': question,
+              'responses': [r.answers[i] for r in responses if i < len(r.answers or [])]}
         if question['type'] in ('single_choice', 'multiple_choice'):
             counts = {}
             for ans in qa['responses']:
@@ -1261,7 +1264,6 @@ def create_feedback(user):
     data      = request.json or {}
     content   = data.get('content', '')
     sentiment = _analyze_sentiment_basic(content)
-
     if ML_AVAILABLE:
         try:
             from ml_engine import orchestrator
@@ -1269,14 +1271,13 @@ def create_feedback(user):
             sentiment = r.get('label', sentiment)
         except Exception:
             pass
-
     fb = Feedback(
-        category  = data.get('category', 'suggestion'),
-        title     = data.get('title'),
-        content   = content,
-        department= user.department,
-        sentiment = sentiment,
-        author_id = user.id,
+        category   = data.get('category', 'suggestion'),
+        title      = data.get('title'),
+        content    = content,
+        department = user.department,
+        sentiment  = sentiment,
+        author_id  = user.id,
     )
     db.session.add(fb)
     db.session.commit()
@@ -1317,7 +1318,6 @@ def get_feedback_stats(user):
         'by_sentiment':  {s: sum(1 for f in all_fb if f.sentiment == s)
                           for s in ['positive','neutral','negative']},
         'by_department': {},
-        'ml_endpoint':   '/api/ml/sentiment/batch-analysis',
     }
     for fb in all_fb:
         d = fb.department or 'N/A'
@@ -1340,11 +1340,11 @@ def get_folders(user):
 def create_folder(user):
     data   = request.json or {}
     folder = DocumentFolder(
-        name      = data.get('name'),
-        parent_id = data.get('parent_id'),
-        icon      = data.get('icon', 'folder'),
-        color     = data.get('color', 'blue'),
-        created_by= user.id,
+        name       = data.get('name'),
+        parent_id  = data.get('parent_id'),
+        icon       = data.get('icon', 'folder'),
+        color      = data.get('color', 'blue'),
+        created_by = user.id,
     )
     db.session.add(folder)
     db.session.commit()
@@ -1358,8 +1358,7 @@ def get_documents(user):
     folder_id = request.args.get('folder_id', type=int)
     search    = request.args.get('search', '').lower()
     file_type = request.args.get('type')
-
-    q = Document.query
+    q         = Document.query
     if folder_id:
         q = q.filter_by(folder_id=folder_id)
     if search:
@@ -1367,16 +1366,12 @@ def get_documents(user):
                              Document.description.ilike(f'%{search}%')))
     if file_type:
         q = q.filter(Document.mime_type.like(f'{file_type}%'))
-
     result = []
     for doc in q.order_by(Document.uploaded_at.desc()).all():
         d = doc.to_dict()
         if doc.uploader:
-            d['uploader'] = {
-                'id': doc.uploader.id,
-                'full_name': doc.uploader.full_name,
-                'department': doc.uploader.department,
-            }
+            d['uploader'] = {'id': doc.uploader.id, 'full_name': doc.uploader.full_name,
+                             'department': doc.uploader.department}
         result.append(d)
     return jsonify(result)
 
@@ -1390,15 +1385,12 @@ def upload_document(user):
     folder_id   = request.form.get('folder_id', type=int)
     description = request.form.get('description', '')
     tags        = request.form.get('tags', '')
-
     if file.filename == '' or not allowed_file(file.filename):
         return jsonify({'error': 'Fichier invalide'}), 400
-
     original = secure_filename(file.filename)
     unique   = f"{datetime.utcnow().timestamp()}_{original}"
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique)
     file.save(filepath)
-
     doc = Document(
         name        = original,
         filename    = unique,
@@ -1503,9 +1495,7 @@ def get_archives_stats(user):
         'total_documents': len(docs),
         'total_size':      sum(d.size or 0 for d in docs),
         'total_downloads': sum(d.downloads for d in docs),
-        'by_type': {},
-        'by_folder': {},
-        'recent_uploads': [],
+        'by_type': {}, 'by_folder': {}, 'recent_uploads': [],
     }
     for doc in docs:
         t = (doc.mime_type or 'unknown').split('/')[0]
@@ -1783,7 +1773,7 @@ def delete_candidat(user, candidat_id):
     return jsonify({'message': 'Candidat supprimé'})
 
 # ============================================
-# ML — INITIALISATION
+# ML
 # ============================================
 
 def init_ml_engine():
@@ -1793,9 +1783,9 @@ def init_ml_engine():
         _refresh_ml_config()
         from ml_engine import orchestrator
         result = orchestrator.initialize(
-            app.config['users'],         app.config['tasks'],
-            app.config['messages'],      app.config['leaves'],
-            app.config['activities'],    app.config['feedbacks'],
+            app.config['users'],      app.config['tasks'],
+            app.config['messages'],   app.config['leaves'],
+            app.config['activities'], app.config['feedbacks'],
             app.config['conversations'],
         )
         print(f"🤖 ML initialisé: {result.get('n_employees', 0)} employés")
@@ -1803,27 +1793,21 @@ def init_ml_engine():
         print(f"⚠️  ML partiel: {e}")
 
 # ============================================
-# SEED DATABASE
+# SEED
 # ============================================
 
 def seed_database():
     if User.query.count() > 0:
         return
     print("📦 Initialisation de la base de données...")
-
     admin = User(
-        email          = 'admin@commsight.com',
-        password       = 'Admin@2025!',
-        full_name      = 'Administrateur Principal',
-        role           = 'admin',
-        department     = 'Direction',
-        position       = 'Directeur Général',
-        phone          = '+213 555 123 456',
-        email_verified = True,
+        email='admin@commsight.com', password='Admin@2025!',
+        full_name='Administrateur Principal', role='admin',
+        department='Direction', position='Directeur Général',
+        phone='+213 555 123 456', email_verified=True,
     )
     db.session.add(admin)
-
-    folders = [
+    db.session.add_all([
         DocumentFolder(id=1, name='Documents RH',            parent_id=None, icon='users',       color='blue'),
         DocumentFolder(id=2, name='Contrats',                 parent_id=1,    icon='file-text',   color='green'),
         DocumentFolder(id=3, name='Fiches de paie',           parent_id=1,    icon='credit-card', color='purple'),
@@ -1831,14 +1815,12 @@ def seed_database():
         DocumentFolder(id=5, name='Factures',                 parent_id=4,    icon='file',        color='red'),
         DocumentFolder(id=6, name='Rapports',                 parent_id=None, icon='bar-chart',   color='cyan'),
         DocumentFolder(id=7, name='Projets',                  parent_id=None, icon='folder',      color='indigo'),
-    ]
-    db.session.add_all(folders)
+    ])
     db.session.commit()
     print("✅ Base de données initialisée")
 
 # ============================================
-# INITIALISATION AU DÉMARRAGE
-# S'exécute à l'import — AVANT toute requête gunicorn
+# INIT AU DÉMARRAGE (import-time → gunicorn OK)
 # ============================================
 
 with app.app_context():
@@ -1852,10 +1834,15 @@ with app.app_context():
 # ============================================
 
 if __name__ == '__main__':
-    print("\n" + "="*70)
-    print("  COMMSIGHT — Backend Flask")
-    print("="*70)
+    port = int(os.environ.get('PORT', 5000))
+    print(f"\n{'='*60}")
+    print(f"  COMMSIGHT  —  http://localhost:{port}")
     print(f"  Admin : admin@commsight.com / Admin@2025!")
-    print(f"  ML    : {'✅' if ML_AVAILABLE else '❌'}")
-    print("="*70 + "\n")
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    print(f"  Resend: {'✅ configuré' if RESEND_API_KEY else '⚠️  RESEND_API_KEY manquante'}")
+    print(f"{'='*60}\n")
+    app.run(debug=True, host='0.0.0.0', port=port)
+
+
+
+
+    #re_g3MioSVJ_KFvC1E426PwQXFBWGMyUL8at
