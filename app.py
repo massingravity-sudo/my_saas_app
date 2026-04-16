@@ -20,7 +20,10 @@ from models_tenant import (
 # ============================================
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=[
+    "http://localhost:5173",
+    "https://https://my-front-app-rust.vercel.app/"
+])
 
 # ── Base de données ──────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
