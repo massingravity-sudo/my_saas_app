@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from datetime import datetime, timedelta
-from PyJWT import jwt
+import jwt
 import secrets
 import smtplib
 from email.mime.text import MIMEText
