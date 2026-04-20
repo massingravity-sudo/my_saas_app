@@ -1732,4 +1732,9 @@ class HRMLOrchestrator:
 
 
 # ── Singleton global ─────────────────────────────────────────────────────────
-orchestrator = HRMLOrchestrator()
+
+try:
+    orchestrator = HRMLOrchestrator()
+except Exception as e:
+    print(f"⚠️  ML Orchestrator non disponible: {e}")
+    orchestrator = None

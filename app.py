@@ -1,152 +1,170 @@
-from flask import Flask, jsonify, request, send_from_directory, Response
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-from flask_sqlalchemy import SQLAlchemy
-from werkzeug.utils import secure_filename
 from datetime import datetime, timedelta
-import os
-import json
-import mimetypes
-import threading
+import jwt
 import secrets
-import re
-import requests   # ← Resend via HTTP
-
-from models_tenant import (
-    Tenant, TenantSubscription, TenantUser,
-    SubscriptionPlan, TenantInvitation, TenantAuditLog
-)
-
-# ============================================
-# CONFIGURATION
-# ============================================
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 app = Flask(__name__)
-CORS(app)
 
-# ── Base de données ──────────────────────────────────────────
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# ── CORS ─────────────────────────────────────────────────────────────────────
+CORS(app, resources={
+    r"/api/*": {
+        "origins": ["*"],
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"],
+    }
+})
 
-_db_url = os.environ.get(
-    'DATABASE_URL',
-    f"sqlite:///{os.path.join(BASE_DIR, 'commsight.db')}"
-)
-# Railway injecte postgres:// — SQLAlchemy 2.x exige postgresql://
-if _db_url.startswith('postgres://'):
-    _db_url = _db_url.replace('postgres://', 'postgresql://', 1)
+# ── Configuration ─────────────────────────────────────────────────────────────
+SECRET_KEY = 'votre_cle_secrete_super_secure_2024'
+app.config['SECRET_KEY'] = SECRET_KEY
 
-app.config['SQLALCHEMY_DATABASE_URI'] = _db_url
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
-    'pool_pre_ping': True,
-    'pool_recycle':  300,
+EMAIL_CONFIG = {
+    'smtp_server':    'smtp.gmail.com',
+    'smtp_port':      587,
+    'sender_email':   'benslimanefaiz7@gmail.com',
+    'sender_password':'yaeylorbnbjsztsj',
+    'sender_name':    'CommSight'
 }
 
-# ── Upload ───────────────────────────────────────────────────
-UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'pdf', 'doc', 'docx', 'xls', 'xlsx'}
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config['UPLOAD_FOLDER']        = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH']   = 16 * 1024 * 1024
+# ═════════════════════════════════════════════════════════════════════════════
+# BASES DE DONNÉES EN MÉMOIRE
+# ═════════════════════════════════════════════════════════════════════════════
+organizations   = [];  org_id_counter   = 1
+users           = [];  user_id_counter  = 1
+otp_codes       = {}
+leaves          = [];  leave_id_counter = 1
+tasks           = [];  task_id_counter  = 1
+messages        = [];  message_id_counter = 1
+conversations   = [];  conversation_id_counter = 1
+posts           = [];  post_id_counter  = 1
+surveys         = [];  survey_id_counter = 1
+survey_responses= [];  survey_response_id_counter = 1
+feedbacks       = [];  feedback_id_counter = 1
+notifications   = [];  notification_id_counter = 1
+activity_logs   = [];  activity_log_id_counter = 1
+evaluations     = [];  evaluation_id_counter = 1
+bonuses         = [];  bonus_id_counter = 1
+absences        = [];  absence_id_counter = 1
+trainings       = [];  training_id_counter = 1
+training_enrollments = []; training_enrollment_id_counter = 1
 
-# ── Resend (remplace Flask-Mail + SMTP) ─────────────────────
-# Met ta clé dans les variables d'env Railway : RESEND_API_KEY
-RESEND_API_KEY    = os.environ.get('RESEND_API_KEY', 're_g3MioSVJ_KFvC1E426PwQXFBWGMyUL8at')
-# L'expéditeur : si tu n'as pas encore de domaine vérifié sur Resend,
-# utilise "onboarding@resend.dev" pour les tests.
-# Dès que tu vérifies ton domaine, mets "CommSight <noreply@tondomaine.com>"
-RESEND_FROM      = os.environ.get('RESEND_FROM', 'noreply@commsight.com')
 
-# ── Initialisation DB ────────────────────────────────────────
-from models import (
-    db, User, LoginHistory, Post, Task, Leave,
-    Notification, Activity, Conversation, Message,
-    Survey, SurveyResponse, Feedback,
-    DocumentFolder, Document,
-    Evaluation, Prime, PosteOuvert, Candidat
-)
-db.init_app(app)
-
-# ── OTP storage ──────────────────────────────────────────────
-verification_codes: dict = {}
-
-# ── Sessions (token → user_id) ───────────────────────────────
-sessions: dict[str, int] = {}
-
-# ============================================
-# EMAIL  —  Resend API HTTP (jamais bloqué)
-# ============================================
-
-def send_email(to: str, subject: str, body: str) -> bool:
+def _sync_app_config():
     """
-    Envoie via l'API HTTP Resend dans un thread daemon.
-    - Jamais bloquant pour gunicorn
-    - Fonctionne sur Railway (pas de SMTP)
-    - Retourne True immédiatement
+    Synchronise les listes globales vers app.config.
+    Les blueprints ML lisent depuis current_app.config — cette fonction
+    garantit que les données sont toujours à jour.
     """
-    if not RESEND_API_KEY:
-        # Pas de clé configurée → log et continue (dev local)
-        print(f"⚠️  RESEND_API_KEY manquante — email non envoyé à {to}")
-        return False
+    app.config['users']         = users
+    app.config['tasks']         = tasks
+    app.config['messages']      = messages
+    app.config['leaves']        = leaves
+    app.config['activities']    = activity_logs
+    app.config['feedbacks']     = feedbacks
+    app.config['conversations'] = conversations
 
-    def _send():
-        try:
-            resp = requests.post(
-                'https://api.resend.com/emails',
-                headers={
-                    'Authorization': f'Bearer {RESEND_API_KEY}',
-                    'Content-Type':  'application/json',
-                },
-                json={
-                    'from':    RESEND_FROM,
-                    'to':      [to],
-                    'subject': subject,
-                    'text':    body,
-                },
-                timeout=15,   # 15s max, ne bloque pas gunicorn (thread séparé)
-            )
-            if resp.status_code in (200, 201):
-                print(f"✅ Email envoyé → {to} [{subject}]")
-            else:
-                print(f"❌ Resend erreur {resp.status_code} → {resp.text}")
-        except Exception as e:
-            print(f"❌ send_email exception: {e}")
-
-    threading.Thread(target=_send, daemon=True).start()
-    return True   # réponse immédiate au client
+# Sync initiale
+_sync_app_config()
 
 
-# ============================================
+# ═════════════════════════════════════════════════════════════════════════════
 # UTILITAIRES
-# ============================================
+# ═════════════════════════════════════════════════════════════════════════════
 
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+def generate_token(user_id):
+    payload = {
+        'user_id': user_id,
+        'exp': datetime.utcnow() + timedelta(days=7)
+    }
+    token = jwt.encode(payload, SECRET_KEY, algorithm='HS256')
+    # Compatible PyJWT 1.x (bytes) ET 2.x (str)
+    return token if isinstance(token, str) else token.decode('utf-8')
 
 
-def validate_password_strength(password):
-    if len(password) < 8:
-        return False, "Le mot de passe doit contenir au moins 8 caractères"
-    if not re.search(r'[A-Z]', password):
-        return False, "Le mot de passe doit contenir au moins une majuscule"
-    if not re.search(r'[a-z]', password):
-        return False, "Le mot de passe doit contenir au moins une minuscule"
-    if not re.search(r'\d', password):
-        return False, "Le mot de passe doit contenir au moins un chiffre"
-    if not re.search(r'[!@#$%^&*(),.?":{}|<>]', password):
-        return False, "Le mot de passe doit contenir au moins un caractère spécial"
-    return True, "Mot de passe valide"
+def verify_token(token):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+        return payload['user_id']
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return None
+
+
+def get_user_from_token(token):
+    user_id = verify_token(token)
+    if user_id:
+        return next((u for u in users if u['id'] == user_id), None)
+    return None
+
+
+def send_email(recipient_email, subject, body):
+    try:
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['From']    = f"{EMAIL_CONFIG['sender_name']} <{EMAIL_CONFIG['sender_email']}>"
+        msg['To']      = recipient_email
+        html_body = f"""
+        <html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
+          <div style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);
+                      padding:30px;text-align:center;">
+            <h1 style="color:white;margin:0;">CommSight</h1>
+          </div>
+          <div style="padding:30px;background:#f7fafc;">{body}</div>
+          <div style="padding:20px;text-align:center;color:#718096;font-size:12px;">
+            <p>© 2026 CommSight — Tous droits réservés</p>
+          </div>
+        </body></html>
+        """
+        msg.attach(MIMEText(html_body, 'html'))
+        with smtplib.SMTP(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['smtp_port']) as server:
+            server.starttls()
+            server.login(EMAIL_CONFIG['sender_email'], EMAIL_CONFIG['sender_password'])
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        print(f"Erreur envoi email: {e}")
+        return False
 
 
 def generate_otp():
     return ''.join([str(secrets.randbelow(10)) for _ in range(6)])
 
 
-def get_user_from_token(token: str):
-    uid = sessions.get(token)
-    if uid is None:
-        return None
-    return db.session.get(User, uid)
+def create_notification(user_id, title, message, notification_type='info'):
+    global notification_id_counter
+    notif = {
+        'id':         notification_id_counter,
+        'user_id':    user_id,
+        'title':      title,
+        'message':    message,
+        'type':       notification_type,
+        'read':       False,
+        'created_at': datetime.now().isoformat()
+    }
+    notifications.append(notif)
+    notification_id_counter += 1
+    return notif
 
+
+def log_activity(user_id, action_type, description):
+    global activity_log_id_counter
+    activity_logs.append({
+        'id':          activity_log_id_counter,
+        'user_id':     user_id,
+        'action_type': action_type,
+        'description': description,
+        'timestamp':   datetime.now().isoformat()
+    })
+    activity_log_id_counter += 1
+    _sync_app_config()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DÉCORATEURS
+# ═════════════════════════════════════════════════════════════════════════════
 
 def require_auth(f):
     def wrapper(*args, **kwargs):
@@ -163,1686 +181,626 @@ def require_admin(f):
     def wrapper(*args, **kwargs):
         token = request.headers.get('Authorization', '').replace('Bearer ', '')
         user  = get_user_from_token(token)
-        if not user or user.role != 'admin':
-            return jsonify({'error': 'Accès refusé - Droits administrateur requis'}), 403
+        if not user or user['role'] != 'admin':
+            return jsonify({'error': 'Accès refusé — droits admin requis'}), 403
         return f(user, *args, **kwargs)
     wrapper.__name__ = f.__name__
     return wrapper
 
 
-def log_activity(user_id: int, action: str, details: str):
-    try:
-        db.session.add(Activity(user_id=user_id, action=action, details=details))
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
+def require_manager_or_admin(f):
+    def wrapper(*args, **kwargs):
+        token = request.headers.get('Authorization', '').replace('Bearer ', '')
+        user  = get_user_from_token(token)
+        if not user or user['role'] not in ['admin', 'manager']:
+            return jsonify({'error': 'Accès refusé — droits manager ou admin requis'}), 403
+        return f(user, *args, **kwargs)
+    wrapper.__name__ = f.__name__
+    return wrapper
 
 
-def create_notification(user_id: int, title: str, message: str, type: str = 'info'):
-    try:
-        n = Notification(user_id=user_id, title=title, message=message, type=type)
-        db.session.add(n)
-        db.session.commit()
-        return n
-    except Exception:
-        db.session.rollback()
-        return None
+# ═════════════════════════════════════════════════════════════════════════════
+# ROUTES — AUTH
+# ═════════════════════════════════════════════════════════════════════════════
 
+@app.route('/api/register', methods=['POST', 'OPTIONS'])
+def register():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
 
-def generate_task_code():
-    year  = datetime.now().year
-    count = Task.query.filter(Task.code.like(f'TSK-{year}-%')).count()
-    return f'TSK-{year}-{str(count + 1).zfill(4)}'
+    global org_id_counter, user_id_counter
 
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({'error': 'Corps de requête JSON manquant'}), 400
 
-def _refresh_ml_config():
-    try:
-        app.config['users']         = [u.to_dict(include_password=True) for u in User.query.all()]
-        app.config['tasks']         = [t.to_dict() for t in Task.query.all()]
-        app.config['messages']      = [m.to_dict() for m in Message.query.all()]
-        app.config['leaves']        = [l.to_dict() for l in Leave.query.all()]
-        app.config['activities']    = [a.to_dict() for a in Activity.query.order_by(
-                                        Activity.timestamp.desc()).limit(500).all()]
-        app.config['feedbacks']     = [f.to_dict() for f in Feedback.query.all()]
-        app.config['conversations'] = [c.to_dict() for c in Conversation.query.all()]
-    except Exception as e:
-        print(f"⚠️  _refresh_ml_config: {e}")
-
-# ============================================
-# MOTEUR ML
-# ============================================
-
-try:
-    from ml_analytics_routes import ml_bp
-    from mlops_layer import mlops_bp
-    app.register_blueprint(ml_bp)
-    app.register_blueprint(mlops_bp)
-    ML_AVAILABLE = True
-    print("✅ Moteur ML chargé")
-except ImportError as e:
-    ML_AVAILABLE = False
-    print(f"⚠️  ML non disponible: {e}")
-
-# ============================================
-# MULTI-TENANT
-# ============================================
-
-try:
-    from tenant_routes import tenant_bp
-    app.register_blueprint(tenant_bp)
-    print("✅ Multi-tenant chargé")
-except ImportError as e:
-    print(f"⚠️  Multi-tenant non disponible: {e}")
-
-# ============================================
-# AUTHENTIFICATION
-# ============================================
-
-@app.route('/api/login', methods=['POST'])
-def login():
-    data     = request.json or {}
-    email    = data.get('email', '').strip()
-    password = data.get('password', '')
-
-    user = User.query.filter_by(email=email).first()
-    if not user:
-        return jsonify({'error': 'Email ou mot de passe incorrect'}), 401
-    if user.login_attempts >= 5:
-        return jsonify({'error': 'Compte bloqué. Contactez un administrateur'}), 403
-    if user.password != password:
-        user.login_attempts += 1
-        db.session.commit()
-        return jsonify({'error': 'Email ou mot de passe incorrect'}), 401
-
-    user.login_attempts = 0
-    user.last_login     = datetime.utcnow()
-    db.session.commit()
-
-    token = f"token_{user.id}_{datetime.utcnow().timestamp()}"
-    sessions[token] = user.id
-    app.config.setdefault('sessions', {})
-    app.config['sessions'][token] = user.id
-
-    db.session.add(LoginHistory(
-        user_id    = user.id,
-        email      = email,
-        ip_address = request.remote_addr,
-        user_agent = request.headers.get('User-Agent', 'Unknown'),
-    ))
-    db.session.commit()
-
-    log_activity(user.id, 'login', f"Connexion de {user.full_name}")
-    _refresh_ml_config()
-    return jsonify({'token': token, 'user': user.to_dict()})
-
-
-@app.route('/api/auth/register-request', methods=['POST'])
-def register_request():
-    data      = request.json or {}
-    email     = data.get('email', '').strip()
-    full_name = data.get('full_name', '')
-
-    if not email or '@' not in email:
-        return jsonify({'error': 'Email invalide'}), 400
-    if User.query.filter_by(email=email).first():
-        return jsonify({'error': 'Cet email est déjà utilisé'}), 400
-
-    code = generate_otp()
-    verification_codes[email] = {
-        'code':    code,
-        'expires': datetime.utcnow() + timedelta(minutes=10),
-        'type':    'registration',
-        'data':    data,
+    required = {
+        'organization_name':     "Nom de l'organisation requis",
+        'organization_industry': "Secteur d'activité requis",
+        'organization_size':     "Taille de l'organisation requise",
+        'full_name':             "Nom complet requis",
+        'email':                 "Email requis",
+        'password':              "Mot de passe requis",
     }
+    for field, msg in required.items():
+        if not str(data.get(field, '')).strip():
+            return jsonify({'error': msg}), 400
+
+    email = data['email'].strip().lower()
+    if '@' not in email:
+        return jsonify({'error': 'Format email invalide'}), 400
+    if any(u['email'] == email for u in users):
+        return jsonify({'error': 'Cet email est déjà utilisé'}), 400
+    if len(data['password']) < 6:
+        return jsonify({'error': 'Le mot de passe doit contenir au moins 6 caractères'}), 400
+
+    # Organisation
+    organization = {
+        'id':       org_id_counter,
+        'name':     data['organization_name'].strip(),
+        'industry': data['organization_industry'].strip(),
+        'size':     data['organization_size'].strip(),
+        'country':  data.get('organization_country', 'Algérie').strip(),
+        'created_at': datetime.now().isoformat(),
+        'settings': {
+            'features': {
+                'surveys': True, 'feedbacks': True, 'analytics': True,
+                'ml_analytics': True, 'two_factor_auth': False,
+                'employee_registration': False
+            },
+            'security': {
+                'password_min_length': 6, 'session_timeout': 30,
+                'max_login_attempts': 5, 'password_expiry_days': 90
+            }
+        }
+    }
+    organizations.append(organization)
+    org_id_counter += 1
+
+    # Utilisateur admin
+    user = {
+        'id':              user_id_counter,
+        'organization_id': organization['id'],
+        'full_name':       data['full_name'].strip(),
+        'email':           email,
+        'password':        data['password'],
+        'phone':           data.get('phone', ''),
+        'position':        data.get('position', 'Administrateur'),
+        'department':      data.get('department', 'Direction'),
+        'role':            'admin',
+        'created_at':      datetime.now().isoformat(),
+        'last_login':      None
+    }
+    users.append(user)
+    user_id_counter += 1
+
+    _sync_app_config()
+
+    token = generate_token(user['id'])
+
     send_email(
-        email,
-        'CommSight - Code de vérification',
-        f"Bonjour {full_name},\n\nVotre code CommSight : {code}\n\nExpire dans 10 minutes.\n\nL'équipe CommSight"
+        user['email'], 'Bienvenue sur CommSight',
+        f"""
+        <h2 style="color:#4c51bf;">Bienvenue {user['full_name']} !</h2>
+        <p>Votre organisation <strong>{organization['name']}</strong>
+           a été créée avec succès.</p>
+        <p>Vous pouvez maintenant vous connecter et commencer à utiliser CommSight.</p>
+        """
     )
-    return jsonify({'message': 'Code envoyé', 'email': email}), 200
+
+    log_activity(user['id'], 'register', f"Inscription de {user['full_name']}")
+
+    user_data = {k: v for k, v in user.items() if k != 'password'}
+    return jsonify({'token': token, 'user': user_data, 'organization': organization}), 201
 
 
-@app.route('/api/auth/verify-code', methods=['POST'])
-def verify_code():
-    data     = request.json or {}
-    email    = data.get('email', '')
-    code     = data.get('code', '')
+@app.route('/api/login', methods=['POST', 'OPTIONS'])
+def login():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({'error': 'Corps de requête JSON manquant'}), 400
+
+    email    = data.get('email', '').strip().lower()
     password = data.get('password', '')
+    if not email or not password:
+        return jsonify({'error': 'Email et mot de passe requis'}), 400
 
-    if email not in verification_codes:
-        return jsonify({'error': 'Aucun code en attente'}), 400
-    stored = verification_codes[email]
-    if datetime.utcnow() > stored['expires']:
-        del verification_codes[email]
+    user = next((u for u in users if u['email'] == email), None)
+    if not user or user['password'] != password:
+        return jsonify({'error': 'Email ou mot de passe incorrect'}), 401
+
+    user['last_login'] = datetime.now().isoformat()
+    token = generate_token(user['id'])
+    log_activity(user['id'], 'login', f"Connexion de {user['full_name']}")
+
+    user_data = {k: v for k, v in user.items() if k != 'password'}
+    return jsonify({'token': token, 'user': user_data})
+
+
+@app.route('/api/forgot-password', methods=['POST', 'OPTIONS'])
+def forgot_password():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    data  = request.get_json(silent=True) or {}
+    email = data.get('email', '').strip().lower()
+    user  = next((u for u in users if u['email'] == email), None)
+    if not user:
+        return jsonify({'error': 'Aucun compte associé à cet email'}), 404
+
+    otp = generate_otp()
+    otp_codes[email] = {'code': otp, 'expires_at': datetime.now() + timedelta(minutes=15)}
+    send_email(email, 'Réinitialisation de votre mot de passe',
+        f"""
+        <h2 style="color:#4c51bf;">Code de vérification</h2>
+        <div style="background:#f7fafc;padding:20px;text-align:center;
+                    margin:20px 0;border-radius:8px;">
+          <h1 style="color:#4c51bf;font-size:36px;letter-spacing:8px;margin:0;">{otp}</h1>
+        </div>
+        <p>Valable 15 minutes.</p>
+        """)
+    return jsonify({'message': 'Code envoyé par email'})
+
+
+@app.route('/api/verify-otp', methods=['POST', 'OPTIONS'])
+def verify_otp():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    data  = request.get_json(silent=True) or {}
+    email = data.get('email', '').strip().lower()
+    code  = data.get('code', '')
+    if email not in otp_codes:
+        return jsonify({'error': 'Code invalide ou expiré'}), 400
+    stored = otp_codes[email]
+    if datetime.now() > stored['expires_at']:
+        del otp_codes[email]
         return jsonify({'error': 'Code expiré'}), 400
     if stored['code'] != code:
         return jsonify({'error': 'Code incorrect'}), 400
-
-    is_valid, msg = validate_password_strength(password)
-    if not is_valid:
-        return jsonify({'error': msg}), 400
-
-    reg  = stored['data']
-    user = User(
-        email          = email,
-        password       = password,
-        full_name      = reg.get('full_name'),
-        role           = 'employee',
-        department     = reg.get('department'),
-        position       = reg.get('position', 'Employé'),
-        phone          = reg.get('phone', ''),
-        email_verified = True,
-    )
-    db.session.add(user)
-    db.session.commit()
-    del verification_codes[email]
-
-    log_activity(user.id, 'account_created', f"Compte créé pour {user.full_name}")
-    _refresh_ml_config()
-    send_email(
-        email,
-        'Bienvenue sur CommSight',
-        f"Bonjour {user.full_name},\n\nVotre compte est créé !\nEmail: {email}\nDépartement: {user.department}\n\nL'équipe CommSight"
-    )
-    return jsonify({'message': 'Compte créé', 'user': user.to_dict()}), 201
+    return jsonify({'message': 'Code vérifié'})
 
 
-@app.route('/api/auth/forgot-password', methods=['POST'])
-def forgot_password():
-    email = (request.json or {}).get('email', '').strip()
-    user  = User.query.filter_by(email=email).first()
-    if not user:
-        return jsonify({'message': 'Si cet email existe, un code a été envoyé'}), 200
-
-    code = generate_otp()
-    verification_codes[email] = {
-        'code':    code,
-        'expires': datetime.utcnow() + timedelta(minutes=15),
-        'type':    'password_reset',
-        'user_id': user.id,
-    }
-    send_email(
-        email,
-        'CommSight - Réinitialisation mot de passe',
-        f"Bonjour {user.full_name},\n\nCode de réinitialisation : {code}\n\nExpire dans 15 minutes.\n\nL'équipe CommSight"
-    )
-    return jsonify({'message': 'Si cet email existe, un code a été envoyé'}), 200
-
-
-@app.route('/api/auth/reset-password', methods=['POST'])
+@app.route('/api/reset-password', methods=['POST', 'OPTIONS'])
 def reset_password():
-    data         = request.json or {}
-    email        = data.get('email', '')
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    data         = request.get_json(silent=True) or {}
+    email        = data.get('email', '').strip().lower()
     code         = data.get('code', '')
     new_password = data.get('new_password', '')
-
-    if email not in verification_codes:
-        return jsonify({'error': 'Aucun code en attente'}), 400
-    stored = verification_codes[email]
-    if stored['type'] != 'password_reset':
-        return jsonify({'error': 'Code invalide'}), 400
-    if datetime.utcnow() > stored['expires']:
-        del verification_codes[email]
+    if email not in otp_codes:
+        return jsonify({'error': 'Code invalide ou expiré'}), 400
+    stored = otp_codes[email]
+    if datetime.now() > stored['expires_at']:
+        del otp_codes[email]
         return jsonify({'error': 'Code expiré'}), 400
     if stored['code'] != code:
         return jsonify({'error': 'Code incorrect'}), 400
-
-    is_valid, msg = validate_password_strength(new_password)
-    if not is_valid:
-        return jsonify({'error': msg}), 400
-
-    user = db.session.get(User, stored['user_id'])
-    if not user:
-        return jsonify({'error': 'Utilisateur introuvable'}), 404
-
-    user.password = new_password
-    db.session.commit()
-    del verification_codes[email]
-    log_activity(user.id, 'password_reset', 'Mot de passe réinitialisé')
-    send_email(
-        email,
-        'CommSight - Mot de passe modifié',
-        f"Bonjour {user.full_name},\n\nVotre mot de passe a été modifié.\n\nSi ce n'est pas vous, contactez l'admin.\n\nL'équipe CommSight"
-    )
-    return jsonify({'message': 'Mot de passe réinitialisé'}), 200
-
-
-@app.route('/api/auth/resend-code', methods=['POST'])
-def resend_code():
-    email = (request.json or {}).get('email', '')
-    if email not in verification_codes:
-        return jsonify({'error': 'Aucune demande en cours'}), 400
-
-    stored            = verification_codes[email]
-    code              = generate_otp()
-    stored['code']    = code
-    stored['expires'] = datetime.utcnow() + timedelta(minutes=10)
-
-    if stored['type'] == 'registration':
-        full_name = stored['data'].get('full_name', 'Utilisateur')
-    else:
-        u         = db.session.get(User, stored.get('user_id'))
-        full_name = u.full_name if u else 'Utilisateur'
-
-    send_email(
-        email,
-        'CommSight - Nouveau code',
-        f"Bonjour {full_name},\n\nNouveau code CommSight : {code}\n\nExpire dans 10 minutes.\n\nL'équipe CommSight"
-    )
-    return jsonify({'message': 'Nouveau code envoyé'}), 200
-
-
-@app.route('/api/auth/login-history', methods=['GET'])
-@require_auth
-def get_login_history(user):
-    history = LoginHistory.query.filter_by(user_id=user.id)\
-                .order_by(LoginHistory.timestamp.desc()).limit(20).all()
-    return jsonify([h.to_dict() for h in history])
-
-
-@app.route('/api/auth/change-password', methods=['POST'])
-@require_auth
-def change_password(user):
-    data             = request.json or {}
-    current_password = data.get('current_password', '')
-    new_password     = data.get('new_password', '')
-
-    if user.password != current_password:
-        return jsonify({'error': 'Mot de passe actuel incorrect'}), 400
-    is_valid, msg = validate_password_strength(new_password)
-    if not is_valid:
-        return jsonify({'error': msg}), 400
-    if new_password == current_password:
-        return jsonify({'error': "Le nouveau mot de passe doit être différent"}), 400
-
-    user.password = new_password
-    db.session.commit()
-    log_activity(user.id, 'password_changed', 'Mot de passe modifié')
-    send_email(
-        user.email,
-        'CommSight - Mot de passe modifié',
-        f"Bonjour {user.full_name},\n\nVotre mot de passe a été modifié.\n\nL'équipe CommSight"
-    )
-    return jsonify({'message': 'Mot de passe modifié'}), 200
-
-# ============================================
-# POSTS
-# ============================================
-
-@app.route('/api/posts', methods=['GET'])
-@require_auth
-def get_posts(user):
-    if user.role == 'admin':
-        posts = Post.query.order_by(Post.created_at.desc()).all()
-    else:
-        posts = Post.query.filter(
-            (Post.department == 'all') | (Post.department == user.department)
-        ).order_by(Post.created_at.desc()).all()
-    return jsonify([p.to_dict() for p in posts])
-
-
-@app.route('/api/posts', methods=['POST'])
-@require_admin
-def create_post(user):
-    data = request.json or {}
-    post = Post(
-        title       = data.get('title'),
-        content     = data.get('content'),
-        type        = data.get('type', 'general'),
-        department  = data.get('department', 'all'),
-        attachments = data.get('attachments', []),
-        author_id   = user.id,
-    )
-    db.session.add(post)
-    db.session.commit()
-
-    targets = User.query.filter_by(role='employee').all()
-    if data.get('department') != 'all':
-        targets = [u for u in targets if u.department == data.get('department')]
-    for t in targets:
-        create_notification(t.id, 'Nouvelle actualité', data.get('title'), 'info')
-
-    log_activity(user.id, 'create_post', f"Publication: {data.get('title')}")
-    _refresh_ml_config()
-    return jsonify(post.to_dict()), 201
-
-
-@app.route('/api/posts/<int:post_id>/like', methods=['POST'])
-@require_auth
-def like_post(user, post_id):
-    post = db.session.get(Post, post_id)
-    if not post:
-        return jsonify({'error': 'Post non trouvé'}), 404
-    post.likes += 1
-    db.session.commit()
-    return jsonify(post.to_dict())
-
-# ============================================
-# TÂCHES
-# ============================================
-
-@app.route('/api/tasks', methods=['GET'])
-@require_auth
-def get_tasks(user):
-    if user.role == 'admin':
-        tasks = Task.query.all()
-    else:
-        tasks = Task.query.filter(
-            (Task.department == user.department) | (Task.assigned_to_id == user.id)
-        ).all()
-    return jsonify([t.to_dict() for t in tasks])
-
-
-@app.route('/api/tasks', methods=['POST'])
-@require_admin
-def create_task(user):
-    data     = request.json or {}
-    deadline = None
-    if data.get('deadline'):
-        try:
-            deadline = datetime.fromisoformat(data['deadline'])
-        except ValueError:
-            pass
-
-    task = Task(
-        code           = generate_task_code(),
-        title          = data.get('title'),
-        description    = data.get('description', ''),
-        priority       = data.get('priority', 'medium'),
-        department     = data.get('department'),
-        assigned_to_id = data.get('assigned_to_id'),
-        created_by_id  = user.id,
-        deadline       = deadline,
-        attachments    = data.get('attachments', []),
-    )
-    db.session.add(task)
-    db.session.commit()
-
-    if task.assigned_to_id:
-        create_notification(task.assigned_to_id, 'Nouvelle tâche assignée',
-                            f"{task.code}: {task.title}", 'task')
-    else:
-        for du in User.query.filter_by(department=task.department, role='employee').all():
-            create_notification(du.id, 'Nouvelle tâche département',
-                                f"{task.code}: {task.title}", 'task')
-
-    log_activity(user.id, 'create_task', f"Tâche créée: {task.code}")
-    _refresh_ml_config()
-    return jsonify(task.to_dict()), 201
-
-
-@app.route('/api/tasks/<int:task_id>', methods=['PUT'])
-@require_auth
-def update_task(user, task_id):
-    task = db.session.get(Task, task_id)
-    if not task:
-        return jsonify({'error': 'Tâche non trouvée'}), 404
-    if user.role != 'admin' and task.department != user.department:
-        return jsonify({'error': 'Accès refusé'}), 403
-
-    data = request.json or {}
-    if 'status' in data:
-        old         = task.status
-        task.status = data['status']
-        if data['status'] == 'done':
-            task.completed_at = datetime.utcnow()
-            create_notification(1, 'Tâche terminée',
-                                f"{task.code} complétée par {user.full_name}", 'success')
-        log_activity(user.id, 'update_task_status', f"{task.code}: {old} → {data['status']}")
-
-    for field in ('title', 'description', 'priority'):
-        if field in data:
-            setattr(task, field, data[field])
-
-    if 'deadline' in data and data['deadline']:
-        try:
-            task.deadline = datetime.fromisoformat(data['deadline'])
-        except ValueError:
-            pass
-
-    task.updated_at = datetime.utcnow()
-    db.session.commit()
-    _refresh_ml_config()
-    return jsonify(task.to_dict())
-
-
-@app.route('/api/tasks/<int:task_id>', methods=['DELETE'])
-@require_admin
-def delete_task(user, task_id):
-    task = db.session.get(Task, task_id)
-    if not task:
-        return jsonify({'error': 'Tâche non trouvée'}), 404
-    log_activity(user.id, 'delete_task', f"Tâche supprimée: {task.code}")
-    db.session.delete(task)
-    db.session.commit()
-    _refresh_ml_config()
-    return jsonify({'message': 'Tâche supprimée'}), 200
-
-# ============================================
-# CONGÉS
-# ============================================
-
-@app.route('/api/leaves', methods=['GET'])
-@require_auth
-def get_leaves(user):
-    if user.role == 'admin':
-        leaves = Leave.query.all()
-    else:
-        leaves = Leave.query.filter_by(employee_id=user.id).all()
-    return jsonify([l.to_dict() for l in leaves])
-
-
-@app.route('/api/leaves', methods=['POST'])
-@require_auth
-def create_leave(user):
-    data  = request.json or {}
-    leave = Leave(
-        type        = data.get('type'),
-        start_date  = data.get('start_date'),
-        end_date    = data.get('end_date'),
-        reason      = data.get('reason', ''),
-        employee_id = user.id,
-    )
-    db.session.add(leave)
-    db.session.commit()
-    create_notification(1, 'Nouvelle demande de congé',
-                        f"{user.full_name} a demandé un congé", 'leave')
-    log_activity(user.id, 'create_leave',
-                 f"Demande congé: {data.get('start_date')} → {data.get('end_date')}")
-    _refresh_ml_config()
-    return jsonify(leave.to_dict()), 201
-
-
-@app.route('/api/leaves/<int:leave_id>/review', methods=['PUT'])
-@require_admin
-def review_leave(user, leave_id):
-    leave = db.session.get(Leave, leave_id)
-    if not leave:
-        return jsonify({'error': 'Congé non trouvé'}), 404
-    data              = request.json or {}
-    leave.status      = data.get('status')
-    leave.reviewed_by = user.full_name
-    leave.reviewed_at = datetime.utcnow()
-    db.session.commit()
-    create_notification(
-        leave.employee_id,
-        f"Congé {leave.status}",
-        f"Votre demande de congé a été {leave.status}",
-        'success' if leave.status == 'approved' else 'error',
-    )
-    log_activity(user.id, 'review_leave',
-                 f"Congé {leave.status}: {leave.employee.full_name}")
-    return jsonify(leave.to_dict())
-
-# ============================================
-# NOTIFICATIONS
-# ============================================
-
-@app.route('/api/notifications', methods=['GET'])
-@require_auth
-def get_notifications(user):
-    notifs = Notification.query.filter_by(user_id=user.id)\
-               .order_by(Notification.created_at.desc()).all()
-    return jsonify([n.to_dict() for n in notifs])
-
-
-@app.route('/api/notifications/<int:notif_id>/read', methods=['PUT'])
-@require_auth
-def mark_notification_read(user, notif_id):
-    notif = Notification.query.filter_by(id=notif_id, user_id=user.id).first()
-    if not notif:
-        return jsonify({'error': 'Notification non trouvée'}), 404
-    notif.read = True
-    db.session.commit()
-    return jsonify(notif.to_dict())
-
-# ============================================
-# DASHBOARD ADMIN
-# ============================================
-
-@app.route('/api/dashboard/stats', methods=['GET'])
-@require_admin
-def get_dashboard_stats(user):
-    tasks_all = Task.query.all()
-    now       = datetime.utcnow()
-    stats = {
-        'users': {'total': User.query.filter_by(role='employee').count(), 'by_department': {}},
-        'tasks': {
-            'total': len(tasks_all),
-            'by_status': {
-                'todo':        sum(1 for t in tasks_all if t.status == 'todo'),
-                'in_progress': sum(1 for t in tasks_all if t.status == 'in_progress'),
-                'done':        sum(1 for t in tasks_all if t.status == 'done'),
-                'blocked':     sum(1 for t in tasks_all if t.status == 'blocked'),
-            },
-            'by_priority': {
-                'low':    sum(1 for t in tasks_all if t.priority == 'low'),
-                'medium': sum(1 for t in tasks_all if t.priority == 'medium'),
-                'high':   sum(1 for t in tasks_all if t.priority == 'high'),
-                'urgent': sum(1 for t in tasks_all if t.priority == 'urgent'),
-            },
-            'overdue': sum(1 for t in tasks_all
-                           if t.deadline and t.deadline < now and t.status != 'done'),
-        },
-        'posts': {
-            'total':     Post.query.count(),
-            'this_week': Post.query.filter(Post.created_at > now - timedelta(days=7)).count(),
-        },
-        'leaves': {
-            'pending':  Leave.query.filter_by(status='pending').count(),
-            'approved': Leave.query.filter_by(status='approved').count(),
-            'rejected': Leave.query.filter_by(status='rejected').count(),
-        },
-        'activity':     [a.to_dict() for a in Activity.query
-                         .order_by(Activity.timestamp.desc()).limit(10).all()],
-        'ml_available': ML_AVAILABLE,
-    }
-    for (dept,) in db.session.query(User.department).filter_by(role='employee').distinct().all():
-        stats['users']['by_department'][dept] = User.query.filter_by(department=dept).count()
-    return jsonify(stats)
-
-# ============================================
-# ANALYTICS
-# ============================================
-
-@app.route('/api/analytics/communication', methods=['GET'])
-@require_admin
-def get_communication_analytics(user):
-    isolated = []
-    for emp in User.query.filter_by(role='employee').all():
-        count = Task.query.filter_by(assigned_to_id=emp.id).count()
-        if count < 2:
-            isolated.append({'id': emp.id, 'name': emp.full_name,
-                             'department': emp.department, 'task_count': count})
-    return jsonify({'isolated_employees': isolated, 'communication_score': 75})
-
-
-@app.route('/api/analytics/performance', methods=['GET'])
-@require_admin
-def get_performance_analytics(user):
-    departments = []
-    for (dept,) in db.session.query(User.department).filter_by(role='employee').distinct().all():
-        all_t     = Task.query.filter_by(department=dept).all()
-        completed = sum(1 for t in all_t if t.status == 'done')
-        total     = len(all_t)
-        departments.append({
-            'name':             dept,
-            'score':            round((completed / total * 100), 1) if total > 0 else 0,
-            'tasks_completed':  completed,
-            'tasks_total':      total,
-            'employees_count':  User.query.filter_by(department=dept).count(),
-        })
-    return jsonify({'departments': departments, 'overall_score': 80})
-
-
-@app.route('/api/analytics/sentiment', methods=['GET'])
-@require_admin
-def get_sentiment_analytics_legacy(user):
-    all_fb = Feedback.query.all()
-    pos    = sum(1 for f in all_fb if f.sentiment == 'positive')
-    neg    = sum(1 for f in all_fb if f.sentiment == 'negative')
-    total  = len(all_fb)
-    score  = 50 + ((pos - neg) / total * 50) if total > 0 else 50
-    return jsonify({
-        'sentiment_score': round(score, 1),
-        'positive_count':  pos,
-        'negative_count':  neg,
-        'neutral_count':   sum(1 for f in all_fb if f.sentiment == 'neutral'),
-        'total_feedbacks': total,
-    })
-
-# ============================================
-# MESSAGERIE
-# ============================================
-
-@app.route('/api/messages/conversations', methods=['GET'])
-@require_auth
-def get_conversations(user):
-    convs  = Conversation.query.filter(Conversation.participants.any(id=user.id)).all()
-    result = []
-    for conv in convs:
-        msgs     = Message.query.filter_by(conversation_id=conv.id)\
-                     .order_by(Message.created_at.desc()).all()
-        last_msg = msgs[0].to_dict() if msgs else None
-        unread   = sum(1 for m in msgs if m.sender_id != user.id and not m.read)
-        other    = next((p for p in conv.participants if p.id != user.id), None)
-        result.append({
-            **conv.to_dict(),
-            'name':         conv.name if conv.type == 'group' else (other.full_name if other else 'Inconnu'),
-            'avatar':       other.avatar if other and conv.type == 'private' else None,
-            'department':   other.department if other and conv.type == 'private' else conv.department,
-            'last_message': last_msg,
-            'unread_count': unread,
-        })
-    result.sort(
-        key=lambda x: x['last_message']['created_at'] if x['last_message'] else x['created_at'],
-        reverse=True,
-    )
-    return jsonify(result)
-
-
-@app.route('/api/messages/conversation/<int:user_id>', methods=['GET', 'POST'])
-@require_auth
-def get_or_create_conversation(user, user_id):
-    other_user = db.session.get(User, user_id)
-    if not other_user:
-        return jsonify({'error': 'Utilisateur non trouvé'}), 404
-
-    existing = Conversation.query.filter_by(type='private').filter(
-        Conversation.participants.any(id=user.id)
-    ).filter(
-        Conversation.participants.any(id=user_id)
-    ).first()
-    if existing:
-        return jsonify(existing.to_dict())
-
-    conv = Conversation(type='private')
-    conv.participants.append(user)
-    conv.participants.append(other_user)
-    db.session.add(conv)
-    db.session.commit()
-    _refresh_ml_config()
-    return jsonify(conv.to_dict()), 201
-
-
-@app.route('/api/messages/<int:conversation_id>', methods=['GET'])
-@require_auth
-def get_messages_route(user, conversation_id):
-    conv = db.session.get(Conversation, conversation_id)
-    if not conv:
-        return jsonify({'error': 'Conversation non trouvée'}), 404
-    if user not in conv.participants:
-        return jsonify({'error': 'Accès refusé'}), 403
-    msgs = Message.query.filter_by(conversation_id=conversation_id)\
-             .order_by(Message.created_at).all()
-    return jsonify([m.to_dict() for m in msgs])
-
-
-@app.route('/api/messages/send', methods=['POST'])
-@require_auth
-def send_message_route(user):
-    data            = request.json or {}
-    conversation_id = data.get('conversation_id')
-    content         = data.get('content', '')
-
-    conv = db.session.get(Conversation, conversation_id)
-    if not conv:
-        return jsonify({'error': 'Conversation non trouvée'}), 404
-    if user not in conv.participants:
-        return jsonify({'error': 'Accès refusé'}), 403
-
-    msg = Message(
-        conversation_id = conversation_id,
-        sender_id       = user.id,
-        content         = content,
-        attachment      = data.get('attachment'),
-    )
-    db.session.add(msg)
-    db.session.commit()
-
-    for participant in conv.participants:
-        if participant.id != user.id:
-            snippet = content[:50] + '...' if len(content) > 50 else content
-            create_notification(participant.id, 'Nouveau message',
-                                f"{user.full_name}: {snippet}", 'info')
-
-    log_activity(user.id, 'send_message', f"Message conv {conversation_id}")
-    _refresh_ml_config()
-    return jsonify(msg.to_dict()), 201
-
-
-@app.route('/api/messages/<int:message_id>/read', methods=['PUT'])
-@require_auth
-def mark_message_read(user, message_id):
-    msg = db.session.get(Message, message_id)
-    if not msg:
-        return jsonify({'error': 'Message non trouvé'}), 404
-    conv = db.session.get(Conversation, msg.conversation_id)
-    if not conv or user not in conv.participants:
-        return jsonify({'error': 'Accès refusé'}), 403
-    msg.read = True
-    db.session.commit()
-    return jsonify(msg.to_dict())
-
-
-@app.route('/api/messages/groups', methods=['GET'])
-@require_auth
-def get_groups(user):
-    if user.role == 'admin':
-        depts = [d for (d,) in db.session.query(User.department)
-                 .filter_by(role='employee').distinct().all()]
-    else:
-        depts = [user.department]
-
-    groups = []
-    for dept in depts:
-        conv = Conversation.query.filter_by(type='group', department=dept).first()
-        if not conv:
-            conv = Conversation(type='group', name=f"Groupe {dept}", department=dept)
-            for u in User.query.filter(
-                (User.department == dept) | (User.role == 'admin')
-            ).all():
-                conv.participants.append(u)
-            db.session.add(conv)
-            db.session.commit()
-        groups.append(conv.to_dict())
-    return jsonify(groups)
-
-# ============================================
-# UTILISATEURS
-# ============================================
-
-@app.route('/api/users/search', methods=['GET'])
-@require_auth
-def search_users(user):
-    q    = request.args.get('q', '').lower()
-    base = User.query.filter(User.id != user.id)
-    if q:
-        base = base.filter(db.or_(
-            User.full_name.ilike(f'%{q}%'),
-            User.email.ilike(f'%{q}%'),
-            User.department.ilike(f'%{q}%'),
-        ))
-    return jsonify([{
-        'id': u.id, 'full_name': u.full_name, 'email': u.email,
-        'department': u.department, 'position': u.position, 'avatar': u.avatar,
-    } for u in base.all()])
-
-
-@app.route('/api/users/by-department', methods=['GET'])
-@require_admin
-def get_users_by_department(user):
-    departments = [
-        'Informatique', 'Ressources Humaines', 'Finance',
-        'Marketing', 'Commercial', 'Production', 'Logistique',
-    ]
-    return jsonify({
-        dept: [u.to_dict() for u in User.query.filter_by(department=dept).all()]
-        for dept in departments
-    })
-
+    user = next((u for u in users if u['email'] == email), None)
+    if user:
+        user['password'] = new_password
+        del otp_codes[email]
+        log_activity(user['id'], 'password_reset', 'Réinitialisation du mot de passe')
+        return jsonify({'message': 'Mot de passe réinitialisé avec succès'})
+    return jsonify({'error': 'Utilisateur non trouvé'}), 404
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ROUTES — UTILISATEURS
+# ═════════════════════════════════════════════════════════════════════════════
 
 @app.route('/api/users', methods=['GET'])
-@require_admin
-def get_users(user):
-    return jsonify([u.to_dict() for u in User.query.filter_by(role='employee').all()])
-
-
-# ── DOIT être AVANT /api/users/<int:user_id> ────────────────
-@app.route('/api/users/export-data', methods=['GET'])
 @require_auth
-def export_user_data(user):
-    export = {
-        'export_date':        datetime.utcnow().isoformat(),
-        'user':               user.to_dict(),
-        'tasks':              [t.to_dict() for t in Task.query.filter_by(assigned_to_id=user.id).all()],
-        'leaves':             [l.to_dict() for l in Leave.query.filter_by(employee_id=user.id).all()],
-        'messages_sent':      [m.to_dict() for m in Message.query.filter_by(sender_id=user.id).all()],
-        'notifications':      [n.to_dict() for n in Notification.query.filter_by(user_id=user.id).all()],
-        'activities':         [a.to_dict() for a in Activity.query.filter_by(user_id=user.id)
-                                .order_by(Activity.timestamp.desc()).all()],
-        'feedbacks':          [f.to_dict() for f in Feedback.query.filter_by(author_id=user.id).all()],
-        'survey_responses':   [r.to_dict() for r in SurveyResponse.query.filter_by(user_id=user.id).all()],
-        'documents_uploaded': [d.to_dict() for d in Document.query.filter_by(uploaded_by=user.id).all()],
-        'login_history':      [h.to_dict() for h in LoginHistory.query.filter_by(user_id=user.id)
-                                .order_by(LoginHistory.timestamp.desc()).all()],
-    }
-    log_activity(user.id, 'export_data', 'Export RGPD')
-    return Response(
-        json.dumps(export, ensure_ascii=False, indent=2),
-        mimetype='application/json',
-        headers={'Content-Disposition': f'attachment; filename=mes-donnees-{user.id}.json'},
+def get_users(user):
+    org_users  = [u for u in users if u['organization_id'] == user['organization_id']]
+    return jsonify([{k: v for k, v in u.items() if k != 'password'} for u in org_users])
+
+
+@app.route('/api/users/<int:user_id>', methods=['GET'])
+@require_auth
+def get_user(user, user_id):
+    target = next(
+        (u for u in users if u['id'] == user_id and u['organization_id'] == user['organization_id']),
+        None
     )
+    if not target:
+        return jsonify({'error': 'Utilisateur non trouvé'}), 404
+    return jsonify({k: v for k, v in target.items() if k != 'password'})
 
 
 @app.route('/api/users/<int:user_id>', methods=['PUT'])
 @require_auth
 def update_user(user, user_id):
-    if user.role != 'admin' and user.id != user_id:
-        return jsonify({'error': 'Accès refusé'}), 403
-    target = db.session.get(User, user_id)
+    if user['id'] != user_id and user['role'] != 'admin':
+        return jsonify({'error': 'Non autorisé'}), 403
+    target = next((u for u in users if u['id'] == user_id), None)
     if not target:
         return jsonify({'error': 'Utilisateur non trouvé'}), 404
-
-    data = request.json or {}
-    if 'full_name' in data and data['full_name'].strip():
-        target.full_name = data['full_name'].strip()
-    if 'phone' in data:
-        target.phone = data['phone'].strip()
-    if 'position' in data and data['position'].strip():
-        target.position = data['position'].strip()
-    if user.role == 'admin':
-        if 'department' in data and data['department'].strip():
-            target.department = data['department'].strip()
-        if 'email' in data and '@' in data['email']:
-            existing = User.query.filter_by(email=data['email']).first()
-            if existing and existing.id != user_id:
-                return jsonify({'error': 'Cet email est déjà utilisé'}), 400
-            target.email = data['email'].strip()
-        if 'role' in data and data['role'] in ('admin', 'employee', 'chef_departement'):
-            target.role = data['role']
-
-    db.session.commit()
-    log_activity(user.id, 'update_profile', f"Profil mis à jour: {target.full_name}")
-    _refresh_ml_config()
-    return jsonify(target.to_dict())
-
-
-@app.route('/api/users/<int:user_id>/set-chef', methods=['PUT'])
-@require_admin
-def set_chef(user, user_id):
-    target = db.session.get(User, user_id)
-    if not target:
-        return jsonify({'error': 'Utilisateur non trouvé'}), 404
-
-    action = (request.json or {}).get('action')
-    if action == 'promote':
-        old_chef = User.query.filter_by(department=target.department,
-                                        role='chef_departement').first()
-        if old_chef and old_chef.id != user_id:
-            old_chef.role = 'employee'
-        target.role = 'chef_departement'
-        log_activity(user.id, 'promote_chef',
-                     f"{target.full_name} nommé chef de {target.department}")
-    elif action == 'revoke':
-        if target.role != 'chef_departement':
-            return jsonify({'error': "Cet utilisateur n'est pas chef de département"}), 400
-        target.role = 'employee'
-        log_activity(user.id, 'revoke_chef',
-                     f"{target.full_name} révoqué de {target.department}")
-    else:
-        return jsonify({'error': 'Action invalide. Utilisez promote ou revoke'}), 400
-
-    db.session.commit()
-    _refresh_ml_config()
-    return jsonify(target.to_dict())
+    data = request.get_json(silent=True) or {}
+    for field in ['full_name', 'phone', 'position', 'department']:
+        if field in data:
+            target[field] = data[field]
+    _sync_app_config()
+    log_activity(user['id'], 'update_profile', f"Profil mis à jour — {target['full_name']}")
+    return jsonify({k: v for k, v in target.items() if k != 'password'})
 
 
 @app.route('/api/users/<int:user_id>', methods=['DELETE'])
-@require_auth
+@require_admin
 def delete_user(user, user_id):
-    if user.role != 'admin' and user.id != user_id:
-        return jsonify({'error': 'Accès refusé'}), 403
-    target = db.session.get(User, user_id)
+    target = next(
+        (u for u in users if u['id'] == user_id and u['organization_id'] == user['organization_id']),
+        None
+    )
     if not target:
         return jsonify({'error': 'Utilisateur non trouvé'}), 404
-    if target.role == 'admin' and User.query.filter_by(role='admin').count() <= 1:
-        return jsonify({'error': 'Impossible de supprimer le dernier administrateur'}), 400
+    if target['role'] == 'admin':
+        return jsonify({'error': 'Impossible de supprimer un administrateur'}), 400
+    target.update({
+        'full_name':  f"Utilisateur supprimé #{target['id']}",
+        'email':      f"deleted_{target['id']}@deleted.com",
+        'phone':      '',
+        'deleted_at': datetime.now().isoformat()
+    })
+    _sync_app_config()
+    log_activity(user['id'], 'delete_user', f"Utilisateur #{user_id} supprimé")
+    return jsonify({'message': 'Utilisateur supprimé'})
 
-    if user.id == user_id:
-        token = request.headers.get('Authorization', '').replace('Bearer ', '')
-        sessions.pop(token, None)
-        app.config.get('sessions', {}).pop(token, None)
 
-    Notification.query.filter_by(user_id=user_id).delete()
-    Activity.query.filter_by(user_id=user_id).delete()
-    LoginHistory.query.filter_by(user_id=user_id).delete()
-    Feedback.query.filter_by(author_id=user_id).update({'author_id': None})
-    SurveyResponse.query.filter_by(user_id=user_id).update({'user_id': None})
-    db.session.delete(target)
-    db.session.commit()
-    _refresh_ml_config()
-    return jsonify({'message': 'Compte supprimé avec succès'}), 200
+# ═════════════════════════════════════════════════════════════════════════════
+# ROUTES — CONGÉS
+# ═════════════════════════════════════════════════════════════════════════════
 
-# ============================================
-# UPLOAD
-# ============================================
-
-@app.route('/api/upload', methods=['POST'])
+@app.route('/api/leaves', methods=['GET', 'POST'])
 @require_auth
-def upload_file(user):
-    if 'file' not in request.files:
-        return jsonify({'error': 'Aucun fichier'}), 400
-    file = request.files['file']
-    if file.filename == '' or not allowed_file(file.filename):
-        return jsonify({'error': 'Fichier invalide ou type non autorisé'}), 400
-    filename = secure_filename(f"{datetime.utcnow().timestamp()}_{file.filename}")
-    file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
-    return jsonify({'filename': filename, 'url': f'/uploads/{filename}'}), 201
+def manage_leaves(user):
+    global leave_id_counter
+    if request.method == 'GET':
+        if user['role'] == 'admin':
+            result = [l for l in leaves if l['organization_id'] == user['organization_id']]
+        elif user['role'] == 'manager':
+            dept_ids = [u['id'] for u in users
+                        if u['department'] == user.get('manager_of_department')
+                        and u['organization_id'] == user['organization_id']]
+            result = [l for l in leaves if l['employee']['id'] in dept_ids]
+        else:
+            result = [l for l in leaves if l['employee']['id'] == user['id']]
+        return jsonify(sorted(result, key=lambda x: x['created_at'], reverse=True))
 
-
-@app.route('/uploads/<filename>')
-def uploaded_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
-
-# ============================================
-# ENQUÊTES & FEEDBACKS
-# ============================================
-
-def _analyze_sentiment_basic(text):
-    tl  = text.lower()
-    pos = sum(1 for w in ['bon','bien','excellent','super','génial','parfait',
-                           'merci','content','satisfait','heureux'] if w in tl)
-    neg = sum(1 for w in ['mauvais','mal','problème','jamais','rien','difficile',
-                           'impossible','mécontent','insatisfait'] if w in tl)
-    if pos > neg: return 'positive'
-    if neg > pos: return 'negative'
-    return 'neutral'
-
-
-@app.route('/api/surveys', methods=['GET'])
-@require_auth
-def get_surveys(user):
-    result = []
-    for s in Survey.query.all():
-        if s.target_department not in ('all', user.department) and user.role != 'admin':
-            continue
-        d = s.to_dict()
-        d['has_responded']  = SurveyResponse.query.filter_by(
-            survey_id=s.id, user_id=user.id).count() > 0
-        d['response_count'] = SurveyResponse.query.filter_by(survey_id=s.id).count()
-        result.append(d)
-    result.sort(key=lambda x: x['created_at'], reverse=True)
-    return jsonify(result)
-
-
-@app.route('/api/surveys', methods=['POST'])
-@require_admin
-def create_survey(user):
-    data     = request.json or {}
-    deadline = None
-    if data.get('deadline'):
-        try:
-            deadline = datetime.fromisoformat(data['deadline'])
-        except ValueError:
-            pass
-    survey = Survey(
-        title             = data.get('title'),
-        description       = data.get('description', ''),
-        target_department = data.get('target_department', 'all'),
-        anonymous         = data.get('anonymous', False),
-        questions         = data.get('questions', []),
-        deadline          = deadline,
-        show_results      = data.get('show_results', False),
-        created_by_id     = user.id,
-    )
-    db.session.add(survey)
-    db.session.commit()
-
-    targets = User.query.filter_by(role='employee').all()
-    if survey.target_department != 'all':
-        targets = [u for u in targets if u.department == survey.target_department]
-    for t in targets:
-        create_notification(t.id, 'Nouvelle enquête',
-                            f"{survey.title} - Votre avis compte !", 'info')
-    log_activity(user.id, 'create_survey', f"Enquête créée: {survey.title}")
-    return jsonify(survey.to_dict()), 201
-
-
-@app.route('/api/surveys/<int:survey_id>', methods=['GET'])
-@require_auth
-def get_survey_detail(user, survey_id):
-    survey = db.session.get(Survey, survey_id)
-    if not survey:
-        return jsonify({'error': 'Enquête non trouvée'}), 404
-    if survey.target_department not in ('all', user.department) and user.role != 'admin':
-        return jsonify({'error': 'Accès refusé'}), 403
-    return jsonify(survey.to_dict())
-
-
-@app.route('/api/surveys/<int:survey_id>/respond', methods=['POST'])
-@require_auth
-def respond_to_survey(user, survey_id):
-    survey = db.session.get(Survey, survey_id)
-    if not survey:
-        return jsonify({'error': 'Enquête non trouvée'}), 404
-    if SurveyResponse.query.filter_by(survey_id=survey_id, user_id=user.id).count():
-        return jsonify({'error': 'Vous avez déjà répondu'}), 400
-    data = request.json or {}
-    r    = SurveyResponse(
-        survey_id  = survey_id,
-        user_id    = user.id if not survey.anonymous else None,
-        department = user.department,
-        answers    = data.get('answers', []),
-    )
-    db.session.add(r)
-    db.session.commit()
-    log_activity(user.id, 'respond_survey', f"Réponse enquête: {survey.title}")
-    return jsonify({'message': 'Réponse enregistrée', 'response': r.to_dict()}), 201
-
-
-@app.route('/api/surveys/<int:survey_id>/results', methods=['GET'])
-@require_admin
-def get_survey_results(user, survey_id):
-    survey = db.session.get(Survey, survey_id)
-    if not survey:
-        return jsonify({'error': 'Enquête non trouvée'}), 404
-    responses   = SurveyResponse.query.filter_by(survey_id=survey_id).all()
-    total_emp_q = User.query.filter_by(role='employee')
-    if survey.target_department != 'all':
-        total_emp_q = total_emp_q.filter_by(department=survey.target_department)
-    total_emp = total_emp_q.count()
-    results = {
-        'survey':             survey.to_dict(),
-        'total_responses':    len(responses),
-        'response_rate':      round(len(responses) / total_emp * 100, 1) if total_emp else 0,
-        'questions_analysis': [],
+    data  = request.get_json(silent=True) or {}
+    leave = {
+        'id':              leave_id_counter,
+        'organization_id': user['organization_id'],
+        'employee': {'id': user['id'], 'full_name': user['full_name'], 'department': user['department']},
+        'type':       data.get('type'),
+        'start_date': data.get('start_date'),
+        'end_date':   data.get('end_date'),
+        'reason':     data.get('reason', ''),
+        'status':     'pending',
+        'created_at': datetime.now().isoformat(),
+        'reviewed_by': None, 'reviewed_at': None
     }
-    for i, question in enumerate(survey.questions or []):
-        qa = {'question': question,
-              'responses': [r.answers[i] for r in responses if i < len(r.answers or [])]}
-        if question['type'] in ('single_choice', 'multiple_choice'):
-            counts = {}
-            for ans in qa['responses']:
-                for opt in (ans if isinstance(ans, list) else [ans]):
-                    counts[opt] = counts.get(opt, 0) + 1
-            qa['option_counts'] = counts
-        elif question['type'] == 'scale':
-            nums = [int(r) for r in qa['responses'] if r]
-            if nums:
-                qa['average'] = round(sum(nums) / len(nums), 2)
-                qa['min']     = min(nums)
-                qa['max']     = max(nums)
-        elif question['type'] == 'text':
-            qa['text_responses'] = qa['responses']
-        results['questions_analysis'].append(qa)
-    return jsonify(results)
+    leaves.append(leave)
+    leave_id_counter += 1
+    _sync_app_config()
+    log_activity(user['id'], 'create_leave', f"Demande de congé: {data.get('type')}")
+    return jsonify(leave), 201
 
 
-@app.route('/api/surveys/<int:survey_id>', methods=['DELETE'])
-@require_admin
-def delete_survey(user, survey_id):
-    survey = db.session.get(Survey, survey_id)
-    if not survey:
-        return jsonify({'error': 'Enquête non trouvée'}), 404
-    log_activity(user.id, 'delete_survey', f"Enquête supprimée: {survey.title}")
-    db.session.delete(survey)
-    db.session.commit()
-    return jsonify({'message': 'Enquête supprimée'}), 200
-
-
-@app.route('/api/feedbacks', methods=['GET'])
-@require_admin
-def get_feedbacks(user):
-    return jsonify([f.to_dict() for f in
-                    Feedback.query.order_by(Feedback.created_at.desc()).all()])
-
-
-@app.route('/api/feedbacks', methods=['POST'])
-@require_auth
-def create_feedback(user):
-    data      = request.json or {}
-    content   = data.get('content', '')
-    sentiment = _analyze_sentiment_basic(content)
-    if ML_AVAILABLE:
-        try:
-            from ml_engine import orchestrator
-            r         = orchestrator.sentiment_analyzer.analyze_text(content, category=None)
-            sentiment = r.get('label', sentiment)
-        except Exception:
-            pass
-    fb = Feedback(
-        category   = data.get('category', 'suggestion'),
-        title      = data.get('title'),
-        content    = content,
-        department = user.department,
-        sentiment  = sentiment,
-        author_id  = user.id,
+@app.route('/api/leaves/<int:leave_id>/review', methods=['PUT'])
+@require_manager_or_admin
+def review_leave(user, leave_id):
+    leave = next((l for l in leaves if l['id'] == leave_id), None)
+    if not leave:
+        return jsonify({'error': 'Demande non trouvée'}), 404
+    data   = request.get_json(silent=True) or {}
+    status = data.get('status')
+    if status not in ['approved', 'rejected']:
+        return jsonify({'error': 'Statut invalide'}), 400
+    leave.update({'status': status, 'reviewed_by': user['full_name'],
+                  'reviewed_at': datetime.now().isoformat()})
+    _sync_app_config()
+    create_notification(
+        leave['employee']['id'],
+        f"Demande de congé {status}",
+        f"Votre demande du {leave['start_date']} au {leave['end_date']} a été "
+        f"{'approuvée' if status == 'approved' else 'rejetée'}",
+        'success' if status == 'approved' else 'warning'
     )
-    db.session.add(fb)
-    db.session.commit()
-    create_notification(1, 'Nouveau feedback',
-                        f"{fb.category.capitalize()}: {fb.title}", 'info')
-    log_activity(user.id, 'create_feedback', f"Feedback soumis: {fb.category}")
-    _refresh_ml_config()
-    return jsonify({'message': 'Feedback enregistré', 'feedback_id': fb.id}), 201
+    return jsonify(leave)
 
 
-@app.route('/api/feedbacks/<int:feedback_id>/respond', methods=['POST'])
-@require_admin
-def respond_to_feedback(user, feedback_id):
-    fb = db.session.get(Feedback, feedback_id)
-    if not fb:
-        return jsonify({'error': 'Feedback non trouvé'}), 404
-    data      = request.json or {}
-    responses = fb.responses or []
-    responses.append({'admin': user.full_name, 'message': data.get('message'),
-                      'created_at': datetime.utcnow().isoformat()})
-    fb.responses = responses
-    fb.status    = data.get('status', 'in_progress')
-    db.session.commit()
-    log_activity(user.id, 'respond_feedback', f"Réponse feedback #{feedback_id}")
-    return jsonify(fb.to_dict())
+# ═════════════════════════════════════════════════════════════════════════════
+# ROUTES — TASKS
+# ═════════════════════════════════════════════════════════════════════════════
 
+@app.route('/api/tasks', methods=['GET', 'POST'])
+@require_auth
+def manage_tasks(user):
+    global task_id_counter
+    if request.method == 'GET':
+        org_tasks = [t for t in tasks if t['organization_id'] == user['organization_id']]
+        if user['role'] != 'admin':
+            org_tasks = [t for t in org_tasks
+                         if user['id'] in t.get('assigned_to', [])
+                         or t.get('created_by') == user['id']]
+        return jsonify(sorted(org_tasks, key=lambda x: x['created_at'], reverse=True))
 
-@app.route('/api/feedbacks/stats', methods=['GET'])
-@require_admin
-def get_feedback_stats(user):
-    all_fb = Feedback.query.all()
-    stats  = {
-        'total':         len(all_fb),
-        'by_category':   {c: sum(1 for f in all_fb if f.category == c)
-                          for c in ['suggestion','probleme','idee','autre']},
-        'by_status':     {s: sum(1 for f in all_fb if f.status == s)
-                          for s in ['new','in_progress','resolved','archived']},
-        'by_sentiment':  {s: sum(1 for f in all_fb if f.sentiment == s)
-                          for s in ['positive','neutral','negative']},
-        'by_department': {},
+    data = request.get_json(silent=True) or {}
+    task = {
+        'id':              task_id_counter,
+        'organization_id': user['organization_id'],
+        'title':           data.get('title', ''),
+        'description':     data.get('description', ''),
+        'priority':        data.get('priority', 'medium'),
+        'status':          'todo',
+        'assigned_to':     data.get('assigned_to', []),
+        'assigned_to_id':  data.get('assigned_to_id'),
+        'department':      data.get('department', user.get('department', '')),
+        'deadline':        data.get('deadline') or data.get('due_date'),
+        'completed_at':    None,
+        'created_by':      user['id'],
+        'created_at':      datetime.now().isoformat(),
+        'updated_at':      datetime.now().isoformat()
     }
-    for fb in all_fb:
-        d = fb.department or 'N/A'
-        stats['by_department'][d] = stats['by_department'].get(d, 0) + 1
-    return jsonify(stats)
+    tasks.append(task)
+    task_id_counter += 1
+    _sync_app_config()
+    return jsonify(task), 201
 
-# ============================================
-# ARCHIVAGE & GED
-# ============================================
 
-@app.route('/api/archives/folders', methods=['GET'])
+@app.route('/api/tasks/<int:task_id>', methods=['PUT'])
 @require_auth
-def get_folders(user):
-    roots = DocumentFolder.query.filter_by(parent_id=None).all()
-    return jsonify([f.to_dict(with_children=True) for f in roots])
-
-
-@app.route('/api/archives/folders', methods=['POST'])
-@require_admin
-def create_folder(user):
-    data   = request.json or {}
-    folder = DocumentFolder(
-        name       = data.get('name'),
-        parent_id  = data.get('parent_id'),
-        icon       = data.get('icon', 'folder'),
-        color      = data.get('color', 'blue'),
-        created_by = user.id,
-    )
-    db.session.add(folder)
-    db.session.commit()
-    log_activity(user.id, 'create_folder', f"Dossier créé: {folder.name}")
-    return jsonify(folder.to_dict()), 201
-
-
-@app.route('/api/archives/documents', methods=['GET'])
-@require_auth
-def get_documents(user):
-    folder_id = request.args.get('folder_id', type=int)
-    search    = request.args.get('search', '').lower()
-    file_type = request.args.get('type')
-    q         = Document.query
-    if folder_id:
-        q = q.filter_by(folder_id=folder_id)
-    if search:
-        q = q.filter(db.or_(Document.name.ilike(f'%{search}%'),
-                             Document.description.ilike(f'%{search}%')))
-    if file_type:
-        q = q.filter(Document.mime_type.like(f'{file_type}%'))
-    result = []
-    for doc in q.order_by(Document.uploaded_at.desc()).all():
-        d = doc.to_dict()
-        if doc.uploader:
-            d['uploader'] = {'id': doc.uploader.id, 'full_name': doc.uploader.full_name,
-                             'department': doc.uploader.department}
-        result.append(d)
-    return jsonify(result)
-
-
-@app.route('/api/archives/documents', methods=['POST'])
-@require_auth
-def upload_document(user):
-    if 'file' not in request.files:
-        return jsonify({'error': 'Aucun fichier fourni'}), 400
-    file        = request.files['file']
-    folder_id   = request.form.get('folder_id', type=int)
-    description = request.form.get('description', '')
-    tags        = request.form.get('tags', '')
-    if file.filename == '' or not allowed_file(file.filename):
-        return jsonify({'error': 'Fichier invalide'}), 400
-    original = secure_filename(file.filename)
-    unique   = f"{datetime.utcnow().timestamp()}_{original}"
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique)
-    file.save(filepath)
-    doc = Document(
-        name        = original,
-        filename    = unique,
-        folder_id   = folder_id,
-        description = description,
-        tags        = tags.split(',') if tags else [],
-        mime_type   = mimetypes.guess_type(original)[0] or 'application/octet-stream',
-        size        = os.path.getsize(filepath),
-        uploaded_by = user.id,
-    )
-    db.session.add(doc)
-    db.session.commit()
-    log_activity(user.id, 'upload_document', f"Document uploadé: {original}")
-    return jsonify(doc.to_dict()), 201
-
-
-@app.route('/api/archives/documents/<int:doc_id>', methods=['GET'])
-@require_auth
-def get_document_detail(user, doc_id):
-    doc = db.session.get(Document, doc_id)
-    if not doc:
-        return jsonify({'error': 'Document non trouvé'}), 404
-    return jsonify(doc.to_dict())
-
-
-@app.route('/api/archives/documents/<int:doc_id>/download', methods=['GET'])
-@require_auth
-def download_document(user, doc_id):
-    doc = db.session.get(Document, doc_id)
-    if not doc:
-        return jsonify({'error': 'Document non trouvé'}), 404
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], doc.filename)
-    if not os.path.exists(filepath):
-        return jsonify({'error': 'Fichier introuvable sur le serveur'}), 404
-    doc.downloads += 1
-    db.session.commit()
-    log_activity(user.id, 'download_document', f"Téléchargement: {doc.name}")
-    return send_from_directory(app.config['UPLOAD_FOLDER'], doc.filename,
-                               as_attachment=True, download_name=doc.name)
-
-
-@app.route('/api/archives/documents/<int:doc_id>', methods=['PUT'])
-@require_auth
-def update_document(user, doc_id):
-    doc = db.session.get(Document, doc_id)
-    if not doc:
-        return jsonify({'error': 'Document non trouvé'}), 404
-    if doc.uploaded_by != user.id and user.role != 'admin':
-        return jsonify({'error': 'Permission refusée'}), 403
-    data = request.json or {}
-    for field in ('name', 'description', 'tags', 'folder_id'):
+def update_task(user, task_id):
+    task = next((t for t in tasks
+                 if t['id'] == task_id and t['organization_id'] == user['organization_id']), None)
+    if not task:
+        return jsonify({'error': 'Tâche non trouvée'}), 404
+    data = request.get_json(silent=True) or {}
+    for field in ['title', 'description', 'priority', 'status', 'assigned_to', 'deadline']:
         if field in data:
-            setattr(doc, field, data[field])
-    db.session.commit()
-    log_activity(user.id, 'update_document', f"Document modifié: {doc.name}")
-    return jsonify(doc.to_dict())
+            task[field] = data[field]
+    if data.get('status') == 'done' and not task.get('completed_at'):
+        task['completed_at'] = datetime.now().isoformat()
+    task['updated_at'] = datetime.now().isoformat()
+    _sync_app_config()
+    return jsonify(task)
 
 
-@app.route('/api/archives/documents/<int:doc_id>', methods=['DELETE'])
+@app.route('/api/tasks/<int:task_id>', methods=['DELETE'])
 @require_auth
-def delete_document(user, doc_id):
-    doc = db.session.get(Document, doc_id)
-    if not doc:
-        return jsonify({'error': 'Document non trouvé'}), 404
-    if doc.uploaded_by != user.id and user.role != 'admin':
-        return jsonify({'error': 'Permission refusée'}), 403
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], doc.filename)
-    if os.path.exists(filepath):
-        os.remove(filepath)
-    log_activity(user.id, 'delete_document', f"Document supprimé: {doc.name}")
-    db.session.delete(doc)
-    db.session.commit()
-    return jsonify({'message': 'Document supprimé'}), 200
+def delete_task(user, task_id):
+    task = next((t for t in tasks
+                 if t['id'] == task_id and t['organization_id'] == user['organization_id']), None)
+    if not task:
+        return jsonify({'error': 'Tâche non trouvée'}), 404
+    tasks.remove(task)
+    _sync_app_config()
+    return jsonify({'message': 'Tâche supprimée'})
 
 
-@app.route('/api/archives/documents/<int:doc_id>/share', methods=['POST'])
+# ═════════════════════════════════════════════════════════════════════════════
+# ROUTES — MESSAGES
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.route('/api/messages', methods=['GET', 'POST'])
 @require_auth
-def share_document(user, doc_id):
-    doc = db.session.get(Document, doc_id)
-    if not doc:
-        return jsonify({'error': 'Document non trouvé'}), 404
-    data   = request.json or {}
-    shared = doc.shared_with or []
-    for uid in data.get('user_ids', []):
-        if uid not in shared:
-            shared.append(uid)
-            target = db.session.get(User, uid)
-            if target:
-                create_notification(uid, 'Document partagé',
-                                    f"{user.full_name} a partagé '{doc.name}' avec vous", 'info')
-    doc.shared_with = shared
-    db.session.commit()
-    log_activity(user.id, 'share_document', f"Document partagé: {doc.name}")
-    return jsonify(doc.to_dict())
+def manage_messages(user):
+    global message_id_counter
+    if request.method == 'GET':
+        result = [m for m in messages
+                  if m['organization_id'] == user['organization_id']
+                  and (m['sender_id'] == user['id'] or user['id'] in m.get('recipients', []))]
+        return jsonify(sorted(result, key=lambda x: x['created_at'], reverse=True))
 
-
-@app.route('/api/archives/stats', methods=['GET'])
-@require_auth
-def get_archives_stats(user):
-    docs  = Document.query.all()
-    stats = {
-        'total_documents': len(docs),
-        'total_size':      sum(d.size or 0 for d in docs),
-        'total_downloads': sum(d.downloads for d in docs),
-        'by_type': {}, 'by_folder': {}, 'recent_uploads': [],
+    data = request.get_json(silent=True) or {}
+    msg  = {
+        'id':              message_id_counter,
+        'organization_id': user['organization_id'],
+        'sender_id':       user['id'],
+        'sender_name':     user['full_name'],
+        'recipients':      data.get('recipients', []),
+        'subject':         data.get('subject', ''),
+        'content':         data.get('content', ''),
+        'created_at':      datetime.now().isoformat(),
+        'read_by':         []
     }
-    for doc in docs:
-        t = (doc.mime_type or 'unknown').split('/')[0]
-        stats['by_type'][t] = stats['by_type'].get(t, 0) + 1
-    for folder in DocumentFolder.query.all():
-        count = Document.query.filter_by(folder_id=folder.id).count()
-        if count:
-            stats['by_folder'][folder.name] = count
-    for doc in Document.query.order_by(Document.uploaded_at.desc()).limit(5).all():
-        up = doc.uploader
-        stats['recent_uploads'].append({
-            'id': doc.id, 'name': doc.name,
-            'uploaded_at': doc.uploaded_at.isoformat(),
-            'uploader': up.full_name if up else 'Inconnu',
-        })
-    return jsonify(stats)
+    messages.append(msg)
+    message_id_counter += 1
+    _sync_app_config()
+    return jsonify(msg), 201
 
-# ============================================
-# ÉVALUATIONS
-# ============================================
 
-@app.route('/api/evaluations', methods=['GET'])
+# ═════════════════════════════════════════════════════════════════════════════
+# ROUTES — POSTS
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.route('/api/posts', methods=['GET', 'POST'])
 @require_auth
-def get_evaluations(user):
-    if user.role == 'admin':
-        evals = Evaluation.query.all()
-    elif user.role == 'chef_departement':
-        evals = Evaluation.query.filter_by(department=user.department).all()
-    else:
-        evals = Evaluation.query.filter_by(employee_id=user.id).all()
-    return jsonify([e.to_dict() for e in evals])
+def manage_posts(user):
+    global post_id_counter
+    if request.method == 'GET':
+        org_posts = [p for p in posts if p['organization_id'] == user['organization_id']]
+        return jsonify(sorted(org_posts, key=lambda x: x['created_at'], reverse=True))
+    data = request.get_json(silent=True) or {}
+    post = {
+        'id':              post_id_counter,
+        'organization_id': user['organization_id'],
+        'title':           data.get('title', ''),
+        'content':         data.get('content', ''),
+        'author_id':       user['id'],
+        'author_name':     user['full_name'],
+        'category':        data.get('category', 'general'),
+        'likes': [], 'comments': [],
+        'created_at':      datetime.now().isoformat(),
+    }
+    posts.append(post)
+    post_id_counter += 1
+    return jsonify(post), 201
 
 
-@app.route('/api/evaluations', methods=['POST'])
+# ═════════════════════════════════════════════════════════════════════════════
+# ROUTES — SURVEYS / FEEDBACKS
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.route('/api/surveys', methods=['GET', 'POST'])
 @require_auth
-def create_evaluation(user):
-    if user.role not in ('admin', 'chef_departement'):
-        return jsonify({'error': 'Accès refusé'}), 403
-    data = request.json or {}
-    ev   = Evaluation(
-        employee_id  = data.get('employee_id'),
-        evaluator_id = user.id,
-        department   = user.department,
-        period       = data.get('period'),
-        scores       = data.get('scores', {}),
-        comment      = data.get('comment', ''),
-        global_score = data.get('global_score', 0),
+def manage_surveys(user):
+    global survey_id_counter
+    if request.method == 'GET':
+        return jsonify([s for s in surveys if s['organization_id'] == user['organization_id']])
+    data = request.get_json(silent=True) or {}
+    survey = {
+        'id':              survey_id_counter,
+        'organization_id': user['organization_id'],
+        'title':           data.get('title', ''),
+        'description':     data.get('description', ''),
+        'questions':       data.get('questions', []),
+        'status':          'active',
+        'created_by':      user['id'],
+        'created_at':      datetime.now().isoformat(),
+        'closes_at':       data.get('closes_at')
+    }
+    surveys.append(survey)
+    survey_id_counter += 1
+    return jsonify(survey), 201
+
+
+@app.route('/api/feedbacks', methods=['GET', 'POST'])
+@require_auth
+def manage_feedbacks(user):
+    global feedback_id_counter
+    if request.method == 'GET':
+        return jsonify([f for f in feedbacks if f['organization_id'] == user['organization_id']])
+    data = request.get_json(silent=True) or {}
+    feedback = {
+        'id':                feedback_id_counter,
+        'organization_id':   user['organization_id'],
+        'title':             data.get('title', ''),
+        'content':           data.get('content', ''),
+        'category':          data.get('category', 'suggestion'),
+        'department':        user.get('department', ''),
+        'submitted_by':      user['id'],
+        'submitted_by_name': user['full_name'],
+        'status':            'pending',
+        'sentiment':         'neutral',
+        'votes':             0,
+        'created_at':        datetime.now().isoformat()
+    }
+    feedbacks.append(feedback)
+    feedback_id_counter += 1
+    _sync_app_config()
+    return jsonify(feedback), 201
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ROUTES — NOTIFICATIONS
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.route('/api/notifications', methods=['GET'])
+@require_auth
+def get_notifications(user):
+    user_notifs = [n for n in notifications if n['user_id'] == user['id']]
+    return jsonify(sorted(user_notifs, key=lambda x: x['created_at'], reverse=True))
+
+
+@app.route('/api/notifications/<int:notif_id>/read', methods=['PUT'])
+@require_auth
+def mark_notification_read(user, notif_id):
+    notif = next(
+        (n for n in notifications if n['id'] == notif_id and n['user_id'] == user['id']), None
     )
-    db.session.add(ev)
-    db.session.commit()
-    create_notification(ev.employee_id, 'Nouvelle évaluation',
-                        'Vous avez reçu une évaluation de votre chef de département', 'info')
-    log_activity(user.id, 'create_evaluation', f"Évaluation pour #{ev.employee_id}")
-    return jsonify(ev.to_dict()), 201
+    if not notif:
+        return jsonify({'error': 'Notification non trouvée'}), 404
+    notif['read'] = True
+    return jsonify(notif)
 
 
-@app.route('/api/evaluations/<int:eval_id>', methods=['PUT'])
-@require_auth
-def update_evaluation(user, eval_id):
-    if user.role not in ('admin', 'chef_departement'):
-        return jsonify({'error': 'Accès refusé'}), 403
-    ev = db.session.get(Evaluation, eval_id)
-    if not ev:
-        return jsonify({'error': 'Évaluation non trouvée'}), 404
-    data = request.json or {}
-    for field in ('scores', 'comment', 'global_score', 'period'):
+# ═════════════════════════════════════════════════════════════════════════════
+# ROUTES — ORGANISATION
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.route('/api/organization/settings', methods=['GET', 'PUT'])
+@require_admin
+def organization_settings(user):
+    org = next((o for o in organizations if o['id'] == user['organization_id']), None)
+    if not org:
+        return jsonify({'error': 'Organisation non trouvée'}), 404
+    if request.method == 'GET':
+        return jsonify(org)
+    data = request.get_json(silent=True) or {}
+    for field in ['name', 'industry', 'size', 'country']:
         if field in data:
-            setattr(ev, field, data[field])
-    db.session.commit()
-    return jsonify(ev.to_dict())
+            org[field] = data[field]
+    return jsonify(org)
 
 
-@app.route('/api/evaluations/<int:eval_id>', methods=['DELETE'])
+@app.route('/api/organization/departments', methods=['GET'])
 @require_auth
-def delete_evaluation(user, eval_id):
-    if user.role not in ('admin', 'chef_departement'):
-        return jsonify({'error': 'Accès refusé'}), 403
-    ev = db.session.get(Evaluation, eval_id)
-    if not ev:
-        return jsonify({'error': 'Évaluation non trouvée'}), 404
-    db.session.delete(ev)
-    db.session.commit()
-    return jsonify({'message': 'Évaluation supprimée'})
-
-# ============================================
-# PRIMES
-# ============================================
-
-@app.route('/api/primes', methods=['GET'])
-@require_auth
-def get_primes(user):
-    if user.role == 'admin':
-        primes = Prime.query.all()
-    elif user.role == 'chef_departement':
-        primes = Prime.query.filter_by(department=user.department).all()
-    else:
-        primes = Prime.query.filter_by(employee_id=user.id).all()
-    return jsonify([p.to_dict() for p in primes])
+def get_departments(user):
+    org_users   = [u for u in users if u['organization_id'] == user['organization_id']]
+    departments = {}
+    for u in org_users:
+        dept = u.get('department', 'Non assigné')
+        if dept not in departments:
+            departments[dept] = {'name': dept, 'employee_count': 0, 'manager': None}
+        departments[dept]['employee_count'] += 1
+        if u.get('role') == 'manager' and u.get('manager_of_department') == dept:
+            departments[dept]['manager'] = {'id': u['id'], 'full_name': u['full_name']}
+    return jsonify(list(departments.values()))
 
 
-@app.route('/api/primes', methods=['POST'])
-@require_auth
-def create_prime(user):
-    if user.role not in ('admin', 'chef_departement'):
-        return jsonify({'error': 'Accès refusé'}), 403
-    data  = request.json or {}
-    prime = Prime(
-        employee_id   = data.get('employee_id'),
-        attributed_by = user.id,
-        department    = user.department,
-        type          = data.get('type', 'performance'),
-        amount        = data.get('amount', 0),
-        period        = data.get('period'),
-        reason        = data.get('reason', ''),
-        status        = 'pending',
-    )
-    db.session.add(prime)
-    db.session.commit()
-    create_notification(prime.employee_id, 'Prime attribuée',
-                        f"Une prime de {prime.amount} DA vous a été attribuée", 'success')
-    log_activity(user.id, 'create_prime', f"Prime {prime.amount} DA → #{prime.employee_id}")
-    return jsonify(prime.to_dict()), 201
+# ═════════════════════════════════════════════════════════════════════════════
+# ROUTE DE TEST
+# ═════════════════════════════════════════════════════════════════════════════
+
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({
+        'message': 'CommSight API',
+        'version': '2.2',
+        'status':  'running',
+        'stats': {
+            'organizations': len(organizations),
+            'users':         len(users),
+            'tasks':         len(tasks),
+            'leaves':        len(leaves),
+            'feedbacks':     len(feedbacks),
+        }
+    })
 
 
-@app.route('/api/primes/<int:prime_id>', methods=['PUT'])
-@require_auth
-def update_prime(user, prime_id):
-    if user.role not in ('admin', 'chef_departement'):
-        return jsonify({'error': 'Accès refusé'}), 403
-    prime = db.session.get(Prime, prime_id)
-    if not prime:
-        return jsonify({'error': 'Prime non trouvée'}), 404
-    data = request.json or {}
-    for field in ('amount', 'reason', 'status', 'period', 'type'):
-        if field in data:
-            setattr(prime, field, data[field])
-    db.session.commit()
-    return jsonify(prime.to_dict())
+# ═════════════════════════════════════════════════════════════════════════════
+# ENREGISTREMENT DES BLUEPRINTS ML
+# Les blueprints lisent depuis current_app.config — synchronisé par _sync_app_config()
+# ═════════════════════════════════════════════════════════════════════════════
+
+try:
+    from ml_analytics import ml_bp
+    app.register_blueprint(ml_bp)
+    print("✅ Blueprint ML Analytics enregistré  → /api/ml/*")
+except Exception as e:
+    print(f"⚠️  ML Analytics non chargé: {e}")
+
+try:
+    from mlops import mlops_bp
+    app.register_blueprint(mlops_bp)
+    print("✅ Blueprint MLOps enregistré          → /api/mlops/*")
+except Exception as e:
+    print(f"⚠️  MLOps non chargé: {e}")
 
 
-@app.route('/api/primes/<int:prime_id>', methods=['DELETE'])
-@require_auth
-def delete_prime(user, prime_id):
-    if user.role not in ('admin', 'chef_departement'):
-        return jsonify({'error': 'Accès refusé'}), 403
-    prime = db.session.get(Prime, prime_id)
-    if not prime:
-        return jsonify({'error': 'Prime non trouvée'}), 404
-    db.session.delete(prime)
-    db.session.commit()
-    return jsonify({'message': 'Prime supprimée'})
-
-# ============================================
-# RECRUTEMENT
-# ============================================
-
-@app.route('/api/recrutement', methods=['GET'])
-@require_auth
-def get_recrutement(user):
-    if user.role == 'admin':
-        postes = PosteOuvert.query.all()
-    elif user.role == 'chef_departement':
-        postes = PosteOuvert.query.filter_by(department=user.department).all()
-    else:
-        return jsonify({'error': 'Accès refusé'}), 403
-    return jsonify([p.to_dict() for p in postes])
-
-
-@app.route('/api/recrutement', methods=['POST'])
-@require_auth
-def create_poste(user):
-    if user.role not in ('admin', 'chef_departement'):
-        return jsonify({'error': 'Accès refusé'}), 403
-    data  = request.json or {}
-    poste = PosteOuvert(
-        title        = data.get('title'),
-        department   = user.department,
-        description  = data.get('description', ''),
-        requirements = data.get('requirements', ''),
-        type_contrat = data.get('type_contrat', 'CDI'),
-        nb_postes    = data.get('nb_postes', 1),
-        created_by   = user.id,
-        status       = 'open',
-    )
-    db.session.add(poste)
-    db.session.commit()
-    log_activity(user.id, 'create_poste', f"Poste ouvert: {poste.title}")
-    return jsonify(poste.to_dict()), 201
-
-
-@app.route('/api/recrutement/<int:poste_id>', methods=['PUT'])
-@require_auth
-def update_poste(user, poste_id):
-    if user.role not in ('admin', 'chef_departement'):
-        return jsonify({'error': 'Accès refusé'}), 403
-    poste = db.session.get(PosteOuvert, poste_id)
-    if not poste:
-        return jsonify({'error': 'Poste non trouvé'}), 404
-    data = request.json or {}
-    for field in ('title','description','requirements','type_contrat','nb_postes','status'):
-        if field in data:
-            setattr(poste, field, data[field])
-    db.session.commit()
-    return jsonify(poste.to_dict())
-
-
-@app.route('/api/recrutement/<int:poste_id>', methods=['DELETE'])
-@require_auth
-def delete_poste(user, poste_id):
-    if user.role not in ('admin', 'chef_departement'):
-        return jsonify({'error': 'Accès refusé'}), 403
-    poste = db.session.get(PosteOuvert, poste_id)
-    if not poste:
-        return jsonify({'error': 'Poste non trouvé'}), 404
-    db.session.delete(poste)
-    db.session.commit()
-    return jsonify({'message': 'Poste supprimé'})
-
-
-@app.route('/api/recrutement/<int:poste_id>/candidats', methods=['GET'])
-@require_auth
-def get_candidats(user, poste_id):
-    if user.role not in ('admin', 'chef_departement'):
-        return jsonify({'error': 'Accès refusé'}), 403
-    return jsonify([c.to_dict() for c in Candidat.query.filter_by(poste_id=poste_id).all()])
-
-
-@app.route('/api/recrutement/<int:poste_id>/candidats', methods=['POST'])
-@require_auth
-def add_candidat(user, poste_id):
-    if user.role not in ('admin', 'chef_departement'):
-        return jsonify({'error': 'Accès refusé'}), 403
-    data     = request.json or {}
-    candidat = Candidat(
-        poste_id  = poste_id,
-        full_name = data.get('full_name'),
-        email     = data.get('email'),
-        phone     = data.get('phone', ''),
-        cv_url    = data.get('cv_url', ''),
-        note      = data.get('note', ''),
-        status    = 'nouveau',
-        added_by  = user.id,
-    )
-    db.session.add(candidat)
-    db.session.commit()
-    return jsonify(candidat.to_dict()), 201
-
-
-@app.route('/api/recrutement/candidats/<int:candidat_id>', methods=['PUT'])
-@require_auth
-def update_candidat(user, candidat_id):
-    if user.role not in ('admin', 'chef_departement'):
-        return jsonify({'error': 'Accès refusé'}), 403
-    candidat = db.session.get(Candidat, candidat_id)
-    if not candidat:
-        return jsonify({'error': 'Candidat non trouvé'}), 404
-    data = request.json or {}
-    for field in ('status', 'note', 'phone', 'email'):
-        if field in data:
-            setattr(candidat, field, data[field])
-    db.session.commit()
-    return jsonify(candidat.to_dict())
-
-
-@app.route('/api/recrutement/candidats/<int:candidat_id>', methods=['DELETE'])
-@require_auth
-def delete_candidat(user, candidat_id):
-    if user.role not in ('admin', 'chef_departement'):
-        return jsonify({'error': 'Accès refusé'}), 403
-    candidat = db.session.get(Candidat, candidat_id)
-    if not candidat:
-        return jsonify({'error': 'Candidat non trouvé'}), 404
-    db.session.delete(candidat)
-    db.session.commit()
-    return jsonify({'message': 'Candidat supprimé'})
-
-# ============================================
-# ML
-# ============================================
-
-def init_ml_engine():
-    if not ML_AVAILABLE:
-        return
-    try:
-        _refresh_ml_config()
-        from ml_engine import orchestrator
-        result = orchestrator.initialize(
-            app.config['users'],      app.config['tasks'],
-            app.config['messages'],   app.config['leaves'],
-            app.config['activities'], app.config['feedbacks'],
-            app.config['conversations'],
-        )
-        print(f"🤖 ML initialisé: {result.get('n_employees', 0)} employés")
-    except Exception as e:
-        print(f"⚠️  ML partiel: {e}")
-
-# ============================================
-# SEED
-# ============================================
-
-def seed_database():
-    if User.query.count() > 0:
-        return
-    print("📦 Initialisation de la base de données...")
-    admin = User(
-        email='admin@commsight.com', password='Admin@2025!',
-        full_name='Administrateur Principal', role='admin',
-        department='Direction', position='Directeur Général',
-        phone='+213 555 123 456', email_verified=True,
-    )
-    db.session.add(admin)
-    db.session.add_all([
-        DocumentFolder(id=1, name='Documents RH',            parent_id=None, icon='users',       color='blue'),
-        DocumentFolder(id=2, name='Contrats',                 parent_id=1,    icon='file-text',   color='green'),
-        DocumentFolder(id=3, name='Fiches de paie',           parent_id=1,    icon='credit-card', color='purple'),
-        DocumentFolder(id=4, name='Documents Administratifs', parent_id=None, icon='briefcase',   color='orange'),
-        DocumentFolder(id=5, name='Factures',                 parent_id=4,    icon='file',        color='red'),
-        DocumentFolder(id=6, name='Rapports',                 parent_id=None, icon='bar-chart',   color='cyan'),
-        DocumentFolder(id=7, name='Projets',                  parent_id=None, icon='folder',      color='indigo'),
-    ])
-    db.session.commit()
-    print("✅ Base de données initialisée")
-
-# ============================================
-# INIT AU DÉMARRAGE (import-time → gunicorn OK)
-# ============================================
-
-with app.app_context():
-    db.create_all()
-    seed_database()
-    init_ml_engine()
-    print("✅ Application initialisée")
-
-# ============================================
-# DÉMARRAGE LOCAL
-# ============================================
+# ═════════════════════════════════════════════════════════════════════════════
+# LANCEMENT
+# ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    print(f"\n{'='*60}")
-    print(f"  COMMSIGHT  —  http://localhost:{port}")
-    print(f"  Admin : admin@commsight.com / Admin@2025!")
-    print(f"  Resend: {'✅ configuré' if RESEND_API_KEY else '⚠️  RESEND_API_KEY manquante'}")
-    print(f"{'='*60}\n")
-    app.run(debug=True, host='0.0.0.0', port=port)
-
-
-
-
-    #re_g3MioSVJ_KFvC1E426PwQXFBWGMyUL8at
+    print("=" * 55)
+    print("🚀 CommSight Backend — port 5000")
+    print(f"✅ Email  : {EMAIL_CONFIG['sender_email']}")
+    print("✅ CORS   : tous origines (Railway production)")
+    print("✅ ML     : chargé si dépendances présentes")
+    print("=" * 55)
+    app.run(debug=True, port=5000)
