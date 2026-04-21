@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from datetime import datetime, timedelta
 import jwt
@@ -9,17 +9,30 @@ from email.mime.multipart import MIMEMultipart
 
 app = Flask(__name__)
 
-# ── CORS ─────────────────────────────────────────────────────────────────────
-CORS(app, resources={
-    r"/api/*": {
-        "origins": [
-        "https://my-front-app-rust.vercel.app"
-        ],
-        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"],
-        "supports_credentials": True
-    }
-})
+# ══════════════════════════════════════════════════════════════════════════════
+# CORS — Solution robuste Railway + Vercel
+# flask-cors seul ne suffit pas sur Railway car il n'injecte pas les headers
+# sur les réponses d'erreur (4xx/5xx) ni sur certains preflight.
+# @after_request garantit la présence des headers sur TOUTES les réponses.
+# ══════════════════════════════════════════════════════════════════════════════
+CORS(app, supports_credentials=False)
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin']  = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    return response
+
+@app.before_request
+def handle_preflight():
+    """Répond 200 immédiatement à tous les preflight OPTIONS."""
+    if request.method == 'OPTIONS':
+        resp = make_response('', 200)
+        resp.headers['Access-Control-Allow-Origin']  = '*'
+        resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        return resp
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 SECRET_KEY = 'votre_cle_secrete_super_secure_2024'
@@ -57,11 +70,7 @@ training_enrollments = []; training_enrollment_id_counter = 1
 
 
 def _sync_app_config():
-    """
-    Synchronise les listes globales vers app.config.
-    Les blueprints ML lisent depuis current_app.config — cette fonction
-    garantit que les données sont toujours à jour.
-    """
+    """Synchronise les listes globales vers app.config pour les blueprints ML."""
     app.config['users']         = users
     app.config['tasks']         = tasks
     app.config['messages']      = messages
@@ -70,7 +79,6 @@ def _sync_app_config():
     app.config['feedbacks']     = feedbacks
     app.config['conversations'] = conversations
 
-# Sync initiale
 _sync_app_config()
 
 
@@ -84,7 +92,6 @@ def generate_token(user_id):
         'exp': datetime.utcnow() + timedelta(days=7)
     }
     token = jwt.encode(payload, SECRET_KEY, algorithm='HS256')
-    # Compatible PyJWT 1.x (bytes) ET 2.x (str)
     return token if isinstance(token, str) else token.decode('utf-8')
 
 
@@ -237,7 +244,6 @@ def register():
     if len(data['password']) < 6:
         return jsonify({'error': 'Le mot de passe doit contenir au moins 6 caractères'}), 400
 
-    # Organisation
     organization = {
         'id':       org_id_counter,
         'name':     data['organization_name'].strip(),
@@ -260,7 +266,6 @@ def register():
     organizations.append(organization)
     org_id_counter += 1
 
-    # Utilisateur admin
     user = {
         'id':              user_id_counter,
         'organization_id': organization['id'],
@@ -276,7 +281,6 @@ def register():
     }
     users.append(user)
     user_id_counter += 1
-
     _sync_app_config()
 
     token = generate_token(user['id'])
@@ -287,12 +291,10 @@ def register():
         <h2 style="color:#4c51bf;">Bienvenue {user['full_name']} !</h2>
         <p>Votre organisation <strong>{organization['name']}</strong>
            a été créée avec succès.</p>
-        <p>Vous pouvez maintenant vous connecter et commencer à utiliser CommSight.</p>
         """
     )
 
     log_activity(user['id'], 'register', f"Inscription de {user['full_name']}")
-
     user_data = {k: v for k, v in user.items() if k != 'password'}
     return jsonify({'token': token, 'user': user_data, 'organization': organization}), 201
 
@@ -332,7 +334,6 @@ def forgot_password():
     user  = next((u for u in users if u['email'] == email), None)
     if not user:
         return jsonify({'error': 'Aucun compte associé à cet email'}), 404
-
     otp = generate_otp()
     otp_codes[email] = {'code': otp, 'expires_at': datetime.now() + timedelta(minutes=15)}
     send_email(email, 'Réinitialisation de votre mot de passe',
@@ -397,7 +398,7 @@ def reset_password():
 @app.route('/api/users', methods=['GET'])
 @require_auth
 def get_users(user):
-    org_users  = [u for u in users if u['organization_id'] == user['organization_id']]
+    org_users = [u for u in users if u['organization_id'] == user['organization_id']]
     return jsonify([{k: v for k, v in u.items() if k != 'password'} for u in org_users])
 
 
@@ -477,12 +478,12 @@ def manage_leaves(user):
         'id':              leave_id_counter,
         'organization_id': user['organization_id'],
         'employee': {'id': user['id'], 'full_name': user['full_name'], 'department': user['department']},
-        'type':       data.get('type'),
-        'start_date': data.get('start_date'),
-        'end_date':   data.get('end_date'),
-        'reason':     data.get('reason', ''),
-        'status':     'pending',
-        'created_at': datetime.now().isoformat(),
+        'type':        data.get('type'),
+        'start_date':  data.get('start_date'),
+        'end_date':    data.get('end_date'),
+        'reason':      data.get('reason', ''),
+        'status':      'pending',
+        'created_at':  datetime.now().isoformat(),
         'reviewed_by': None, 'reviewed_at': None
     }
     leaves.append(leave)
@@ -763,7 +764,7 @@ def get_departments(user):
 def home():
     return jsonify({
         'message': 'CommSight API',
-        'version': '2.2',
+        'version': '2.3',
         'status':  'running',
         'stats': {
             'organizations': len(organizations),
@@ -776,21 +777,20 @@ def home():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# ENREGISTREMENT DES BLUEPRINTS ML
-# Les blueprints lisent depuis current_app.config — synchronisé par _sync_app_config()
+# BLUEPRINTS ML
 # ═════════════════════════════════════════════════════════════════════════════
 
 try:
     from ml_analytics import ml_bp
     app.register_blueprint(ml_bp)
-    print("✅ Blueprint ML Analytics enregistré  → /api/ml/*")
+    print("✅ ML Analytics  → /api/ml/*")
 except Exception as e:
     print(f"⚠️  ML Analytics non chargé: {e}")
 
 try:
     from mlops import mlops_bp
     app.register_blueprint(mlops_bp)
-    print("✅ Blueprint MLOps enregistré          → /api/mlops/*")
+    print("✅ MLOps         → /api/mlops/*")
 except Exception as e:
     print(f"⚠️  MLOps non chargé: {e}")
 
@@ -803,7 +803,6 @@ if __name__ == '__main__':
     print("=" * 55)
     print("🚀 CommSight Backend — port 5000")
     print(f"✅ Email  : {EMAIL_CONFIG['sender_email']}")
-    print("✅ CORS   : tous origines (Railway production)")
-    print("✅ ML     : chargé si dépendances présentes")
+    print("✅ CORS   : Railway + Vercel (after_request)")
     print("=" * 55)
     app.run(debug=True, port=5000)
